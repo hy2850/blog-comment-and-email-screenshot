@@ -1010,6 +1010,7 @@ class App(tk.Tk):
 
         self.url_var = tk.StringVar(value="https://m.blog.naver.com/shuchel/224296188790")
         self.nickname_var = tk.StringVar()
+        self.email_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_SAVE_DIR))
         self.status_var = tk.StringVar(value="링크와 닉네임을 입력한 뒤 캡처를 시작하세요.")
         self.email_status_var = tk.StringVar(value="찾은 이메일: 없음")
@@ -1027,7 +1028,7 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(6, weight=1)
+        outer.rowconfigure(7, weight=1)
 
         ttk.Label(outer, text="블로그 글 링크").grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
         ttk.Entry(outer, textvariable=self.url_var).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
@@ -1035,12 +1036,15 @@ class App(tk.Tk):
         ttk.Label(outer, text="닉네임").grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
         ttk.Entry(outer, textvariable=self.nickname_var, width=30).grid(row=1, column=1, sticky=tk.EW, pady=(0, 8))
 
-        ttk.Label(outer, text="저장 폴더").grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.output_dir_var).grid(row=2, column=1, sticky=tk.EW, pady=(0, 8))
-        ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir).grid(row=2, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
+        ttk.Label(outer, text="이메일 (댓글에서 자동 추출 or 직접입력)").grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Entry(outer, textvariable=self.email_var).grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
+
+        ttk.Label(outer, text="저장 폴더").grid(row=3, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Entry(outer, textvariable=self.output_dir_var).grid(row=3, column=1, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir).grid(row=3, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
 
         button_bar = ttk.Frame(outer)
-        button_bar.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
+        button_bar.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
         self.start_button = ttk.Button(button_bar, text="찾고 캡처", command=self.start_find_or_capture)
         self.start_button.pack(side=tk.LEFT)
         self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
@@ -1056,7 +1060,6 @@ class App(tk.Tk):
             button_bar,
             text="이메일 본문 캡처",
             command=self.start_email_capture,
-            state=tk.DISABLED,
         )
         self.email_capture_button.pack(side=tk.LEFT, padx=(8, 0))
         self.open_folder_button = ttk.Button(button_bar, text="저장 폴더 열기", command=self.open_output_dir)
@@ -1066,10 +1069,10 @@ class App(tk.Tk):
         self.progress.pack(side=tk.RIGHT)
 
         ttk.Label(outer, textvariable=self.status_var, foreground="#155724").grid(
-            row=4, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+            row=5, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
         )
         ttk.Label(outer, textvariable=self.email_status_var, foreground="#0b5394").grid(
-            row=5, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+            row=6, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
         )
 
         self.tree = ttk.Treeview(
@@ -1089,18 +1092,18 @@ class App(tk.Tk):
         self.tree.column("date", width=150, stretch=False)
         self.tree.column("preview", width=360, stretch=True)
         self.tree.column("secret", width=60, anchor=tk.CENTER, stretch=False)
-        self.tree.grid(row=6, column=0, columnspan=3, sticky=tk.NSEW)
+        self.tree.grid(row=7, column=0, columnspan=3, sticky=tk.NSEW)
 
         scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
-        scroll.grid(row=6, column=3, sticky=tk.NS)
+        scroll.grid(row=7, column=3, sticky=tk.NS)
 
         note = (
             "앱 전용 Chrome 프로필을 사용합니다. 첫 사용이면 '네이버 로그인 열기'로 로그인한 뒤 "
             "그 Chrome 창을 그대로 둔 채 캡처를 시작하세요. 비밀댓글은 로그인 계정에서 보이는 경우에만 캡처됩니다."
         )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=720).grid(
-            row=7, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
+            row=8, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
         )
 
     def choose_output_dir(self) -> None:
@@ -1172,11 +1175,14 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def start_email_capture(self, selected_mail_id: str | None = None) -> None:
-        if not self.last_found_email:
-            messagebox.showinfo(APP_TITLE, "먼저 이메일이 포함된 댓글을 캡처해 주세요.")
+        emails = extract_emails(self.email_var.get())
+        if not emails:
+            messagebox.showinfo(APP_TITLE, "이메일 칸에 이메일 주소를 입력해 주세요.")
             return
 
-        email = self.last_found_email
+        email = emails[0]
+        if self.email_var.get().strip() != email:
+            self.email_var.set(email)
         output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
         self.set_busy(True)
         self.status_var.set("네이버 메일에서 이메일을 찾는 중입니다...")
@@ -1254,7 +1260,7 @@ class App(tk.Tk):
         state = tk.DISABLED if busy else tk.NORMAL
         self.start_button.configure(state=state)
         self.login_button.configure(state=state)
-        self.email_capture_button.configure(state=tk.DISABLED if busy or not self.last_found_email else tk.NORMAL)
+        self.email_capture_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.open_folder_button.configure(state=state)
         if busy:
             self.capture_selected_button.configure(state=tk.DISABLED)
@@ -1263,8 +1269,7 @@ class App(tk.Tk):
             self.progress.stop()
             if self.current_candidates:
                 self.capture_selected_button.configure(state=tk.NORMAL)
-            if self.last_found_email:
-                self.email_capture_button.configure(state=tk.NORMAL)
+            self.email_capture_button.configure(state=tk.NORMAL)
 
     def clear_candidates(self) -> None:
         self.current_candidates = []
@@ -1278,7 +1283,6 @@ class App(tk.Tk):
         self.last_comment_text = ""
         self.last_comment_saved_path = None
         self.email_status_var.set("찾은 이메일: 없음")
-        self.email_capture_button.configure(state=tk.DISABLED)
 
     def update_email_state(self, result: CaptureResult) -> None:
         self.last_found_email = result.email
@@ -1286,15 +1290,14 @@ class App(tk.Tk):
         self.last_comment_text = result.comment_text or ""
         self.last_comment_saved_path = result.comment_saved_path or result.saved_path
         if result.email:
+            self.email_var.set(result.email)
             if len(self.last_found_emails) > 1:
                 all_emails = ", ".join(self.last_found_emails)
                 self.email_status_var.set(f"찾은 이메일: {result.email} (전체: {all_emails})")
             else:
                 self.email_status_var.set(f"찾은 이메일: {result.email}")
-            self.email_capture_button.configure(state=tk.NORMAL)
         else:
             self.email_status_var.set("찾은 이메일: 없음")
-            self.email_capture_button.configure(state=tk.DISABLED)
 
     def show_mail_choice_dialog(self, email: str, candidates: list[dict[str, Any]]) -> None:
         dialog = tk.Toplevel(self)
