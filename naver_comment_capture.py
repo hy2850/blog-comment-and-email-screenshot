@@ -329,7 +329,7 @@ def run_capture(
 
         try:
             report("첫 번째 Chrome 탭을 준비하는 중...")
-            page = context.pages[0] if context.pages else context.new_page()
+            page = get_blog_page(context)
             page.set_default_timeout(10_000)
             open_comments(page, post, PlaywrightTimeoutError, report)
             report("댓글 후보를 분석하는 중...")
@@ -696,7 +696,7 @@ def run_mail_capture(
             ) from exc
 
         try:
-            page = get_work_page(context)
+            page = get_mail_page(context)
             page.set_default_timeout(12_000)
 
             mail_id = selected_mail_id
@@ -726,14 +726,99 @@ def run_mail_capture(
                 context.close()
 
 
-def get_work_page(context: Any) -> Any:
+def get_blog_page(context: Any) -> Any:
+    pages = open_pages(context)
+    blog_page = find_page_by_hosts(pages, ("blog.naver.com", "m.blog.naver.com"))
+    if blog_page:
+        bring_page_to_front(blog_page)
+        return blog_page
+
+    non_login_pages = [page for page in pages if not is_login_page(page)]
+    blank_page = first_blank_page(non_login_pages)
+    if blank_page:
+        bring_page_to_front(blank_page)
+        return blank_page
+
+    if non_login_pages:
+        bring_page_to_front(non_login_pages[0])
+        return non_login_pages[0]
+
+    page = context.new_page()
+    bring_page_to_front(page)
+    return page
+
+
+def get_mail_page(context: Any) -> Any:
+    pages = open_pages(context)
+    mail_page = find_page_by_hosts(pages, ("mail.naver.com",))
+    if mail_page:
+        bring_page_to_front(mail_page)
+        return mail_page
+
+    non_login_pages = [page for page in pages if not is_login_page(page)]
+    blank_pages = [page for page in non_login_pages if is_blank_page(page)]
+    if len(blank_pages) >= 2:
+        bring_page_to_front(blank_pages[1])
+        return blank_pages[1]
+
+    if len(non_login_pages) >= 2:
+        bring_page_to_front(non_login_pages[1])
+        return non_login_pages[1]
+
+    page = context.new_page()
+    bring_page_to_front(page)
+    return page
+
+
+def open_pages(context: Any) -> list[Any]:
+    pages: list[Any] = []
     for page in context.pages:
         try:
             if not page.is_closed():
-                return page
+                pages.append(page)
         except Exception:
             continue
-    return context.new_page()
+    return pages
+
+
+def find_page_by_hosts(pages: list[Any], hosts: tuple[str, ...]) -> Any | None:
+    for page in pages:
+        try:
+            host = urlparse(page.url or "").netloc.casefold()
+        except Exception:
+            host = ""
+        if any(host == expected or host.endswith("." + expected) for expected in hosts):
+            return page
+    return None
+
+
+def first_blank_page(pages: list[Any]) -> Any | None:
+    for page in pages:
+        if is_blank_page(page):
+            return page
+    return None
+
+
+def is_blank_page(page: Any) -> bool:
+    try:
+        return (page.url or "").casefold() in ("", "about:blank")
+    except Exception:
+        return False
+
+
+def is_login_page(page: Any) -> bool:
+    try:
+        url = (page.url or "").casefold()
+    except Exception:
+        return False
+    return "nid.naver.com" in url or "nidlogin" in url
+
+
+def bring_page_to_front(page: Any) -> None:
+    try:
+        page.bring_to_front()
+    except Exception:
+        pass
 
 
 def open_mail_search(page: Any, email: str, timeout_error_type: type[Exception]) -> None:
