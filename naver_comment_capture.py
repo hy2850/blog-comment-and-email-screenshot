@@ -195,6 +195,75 @@ def parse_blog_post(raw_url: str) -> BlogPost:
     )
 
 
+def current_page_matches_post(page: Any, post: BlogPost, raw_url: str) -> bool:
+    try:
+        current_url = page.url or ""
+    except Exception:
+        return False
+    return url_matches_post(current_url, post, raw_url)
+
+
+def url_matches_post(current_url: str, post: BlogPost, raw_url: str) -> bool:
+    current = normalize_url_prefix(current_url)
+    if not current or current == "about:blank":
+        return False
+
+    for candidate in post_url_prefix_candidates(post, raw_url):
+        if candidate and current.startswith(candidate):
+            return True
+
+    return url_has_post_identity(current_url, post)
+
+
+def post_url_prefix_candidates(post: BlogPost, raw_url: str) -> list[str]:
+    mobile_postview_url = (
+        "https://m.blog.naver.com/PostView.naver"
+        f"?blogId={quote(post.blog_id)}&logNo={post.log_no}"
+    )
+    urls = [
+        raw_url,
+        post.mobile_url,
+        post.mobile_comment_url,
+        mobile_postview_url,
+        post.desktop_postview_url,
+    ]
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        normalized = normalize_url_prefix(url)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            candidates.append(normalized)
+    return candidates
+
+
+def normalize_url_prefix(value: str) -> str:
+    url = compact_text(value)
+    if not url:
+        return ""
+    if "://" not in url and not url.casefold().startswith("about:"):
+        url = "https://" + url
+    parsed = urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        url = parsed._replace(fragment="").geturl()
+    return url.rstrip("/").casefold()
+
+
+def url_has_post_identity(url: str, post: BlogPost) -> bool:
+    parsed = urlparse(compact_text(url))
+    query = parse_qs(parsed.query)
+    query_blog_id = first_query_value(query, "blogId")
+    query_log_no = first_query_value(query, "logNo")
+    if query_blog_id.casefold() == post.blog_id.casefold() and query_log_no == post.log_no:
+        return True
+
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    for index, part in enumerate(parts[:-1]):
+        if part.casefold() == post.blog_id.casefold() and parts[index + 1] == post.log_no:
+            return True
+    return False
+
+
 def first_query_value(query: dict[str, list[str]], key: str) -> str:
     values = query.get(key) or []
     return values[0].strip() if values else ""
@@ -331,7 +400,16 @@ def run_capture(
             report("첫 번째 Chrome 탭을 준비하는 중...")
             page = get_blog_page(context)
             page.set_default_timeout(10_000)
-            open_comments(page, post, PlaywrightTimeoutError, report)
+            reuse_current_page = current_page_matches_post(page, post, raw_url)
+            if reuse_current_page:
+                report("현재 블로그 탭의 글을 그대로 사용합니다.")
+            open_comments(
+                page,
+                post,
+                PlaywrightTimeoutError,
+                report,
+                reuse_current_page=reuse_current_page,
+            )
             report("댓글 후보를 분석하는 중...")
             entries, match_mode = find_matching_comments(page, nickname, forced_match_mode)
 
@@ -378,13 +456,21 @@ def open_comments(
     post: BlogPost,
     timeout_error_type: type[Exception],
     report: Callable[[str], None] | None = None,
+    reuse_current_page: bool = False,
 ) -> None:
     def tell(message: str) -> None:
         if report:
             report(message)
 
-    tell("블로그 글을 여는 중...")
-    goto_page(page, post.mobile_url, timeout_error_type)
+    if reuse_current_page:
+        if wait_for_comment_area(page, timeout_ms=1_200):
+            tell("댓글창이 이미 열려 있어 바로 댓글을 찾습니다.")
+            return
+        tell("현재 글에서 댓글창을 여는 중...")
+    else:
+        tell("블로그 글을 여는 중...")
+        goto_page(page, post.mobile_url, timeout_error_type)
+
     tell("댓글 버튼을 누르는 중...")
     try_click_comment_button(page)
     if wait_for_comment_area(page):
