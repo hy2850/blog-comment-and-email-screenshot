@@ -25,6 +25,7 @@ CHROME_USER_DATA_DIR = APP_DIR / "chrome-profile"
 LOGIN_URL = "https://nid.naver.com/nidlogin.login"
 CDP_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
+EMAIL_PATTERN = re.compile(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}", re.IGNORECASE)
 
 COMMENT_CONTAINER_SELECTORS = [
     ".u_cbox_comment_box",
@@ -102,6 +103,19 @@ class CaptureResult:
     candidates: list[dict[str, Any]] | None = None
     match_mode: str | None = None
     visible_nicknames: list[str] | None = None
+    email: str | None = None
+    emails: list[str] | None = None
+    comment_text: str | None = None
+    comment_saved_path: Path | None = None
+
+
+@dataclass
+class MailCaptureResult:
+    status: str
+    email: str
+    saved_path: Path | None = None
+    candidates: list[dict[str, Any]] | None = None
+    mail_id: str | None = None
 
 
 def compact_text(value: str) -> str:
@@ -133,6 +147,18 @@ def sanitize_filename(value: str) -> str:
     value = re.sub(r'[\\/:*?"<>|]+', "_", value)
     value = value.strip(" .")
     return value[:80] or "nickname"
+
+
+def extract_emails(value: str) -> list[str]:
+    emails: list[str] = []
+    seen: set[str] = set()
+    for match in EMAIL_PATTERN.findall(value or ""):
+        email = match.strip(".,;:()[]{}<>\"'")
+        key = email.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            emails.append(email)
+    return emails
 
 
 def write_log(message: str) -> None:
@@ -331,7 +357,17 @@ def run_capture(
             entry = entries[target_index]
             output_path = make_output_path(output_dir, post, nickname)
             capture_entry(page, entry, output_path)
-            return CaptureResult(status="captured", saved_path=output_path, match_mode=match_mode)
+            comment_text = "\n".join(part for part in [entry.content, entry.text] if part)
+            emails = extract_emails(comment_text)
+            return CaptureResult(
+                status="captured",
+                saved_path=output_path,
+                match_mode=match_mode,
+                email=emails[0] if emails else None,
+                emails=emails,
+                comment_text=comment_text,
+                comment_saved_path=output_path,
+            )
         finally:
             if close_context_when_done and context is not None:
                 context.close()
@@ -593,6 +629,241 @@ def capture_entry(page: Any, entry: CommentEntry, output_path: Path) -> None:
     entry.handle.screenshot(path=str(output_path))
 
 
+def run_mail_capture(
+    email: str,
+    output_dir: Path,
+    selected_mail_id: str | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> MailCaptureResult:
+    def report(message: str) -> None:
+        write_log(message)
+        if progress:
+            progress(message)
+
+    email = compact_text(email)
+    if not email:
+        raise CommentCaptureError("먼저 댓글에서 이메일을 찾아야 합니다.")
+
+    report("메일 캡처 환경 확인 중...")
+    ensure_local_environment()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CommentCaptureError(
+            "Playwright가 설치되어 있지 않습니다. run_naver_comment_capture.bat으로 실행하면 자동 설치됩니다."
+        ) from exc
+
+    context = None
+    close_context_when_done = False
+    with sync_playwright() as playwright:
+        try:
+            if is_automation_chrome_running():
+                report("열려 있는 로그인 Chrome에 연결하는 중...")
+                try:
+                    browser = playwright.chromium.connect_over_cdp(CDP_URL, timeout=10_000)
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                except Exception as exc:
+                    raise CommentCaptureError(
+                        "열려 있는 로그인용 Chrome에 연결하지 못했습니다. 로그인/캡처용 Chrome 창을 닫고 다시 시도해 주세요."
+                    ) from exc
+            else:
+                report("Chrome 프로필을 여는 중...")
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(CHROME_USER_DATA_DIR),
+                    executable_path=str(CHROME_EXE),
+                    headless=False,
+                    viewport={"width": 1100, "height": 900},
+                    locale="ko-KR",
+                    timezone_id="Asia/Seoul",
+                    timeout=30_000,
+                    args=[
+                        f"--remote-debugging-port={CDP_PORT}",
+                        "--remote-debugging-address=127.0.0.1",
+                        "--no-first-run",
+                        "--disable-session-crashed-bubble",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                close_context_when_done = True
+        except Exception as exc:
+            if isinstance(exc, CommentCaptureError):
+                raise
+            raise CommentCaptureError(
+                "앱 전용 Chrome 프로필을 열지 못했습니다. 로그인용 Chrome 창을 닫고 다시 실행해 주세요."
+            ) from exc
+
+        try:
+            page = get_work_page(context)
+            page.set_default_timeout(12_000)
+
+            mail_id = selected_mail_id
+            if not mail_id:
+                report(f"네이버 메일에서 {email} 검색 중...")
+                open_mail_search(page, email, PlaywrightTimeoutError)
+                report("메일 검색 결과를 분석하는 중...")
+                entries = collect_mail_entries(page)
+                if not entries:
+                    raise CommentCaptureError(
+                        f"'{email}'로 검색된 메일을 찾지 못했습니다. 네이버 메일 로그인 상태와 검색 결과를 확인해 주세요."
+                    )
+                if len(entries) > 1:
+                    return MailCaptureResult(status="multiple", email=email, candidates=entries)
+                mail_id = entries[0]["mail_id"]
+
+            report("메일 본문을 여는 중...")
+            read_url = f"https://mail.naver.com/v2/popup/read/1/{mail_id}"
+            goto_page(page, read_url, PlaywrightTimeoutError)
+            ensure_mail_accessible(page)
+            report("메일 본문을 캡처하는 중...")
+            output_path = make_mail_output_path(output_dir, email, mail_id)
+            capture_mail_body(page, output_path)
+            return MailCaptureResult(status="captured", email=email, saved_path=output_path, mail_id=mail_id)
+        finally:
+            if close_context_when_done and context is not None:
+                context.close()
+
+
+def get_work_page(context: Any) -> Any:
+    for page in context.pages:
+        try:
+            if not page.is_closed():
+                return page
+        except Exception:
+            continue
+    return context.new_page()
+
+
+def open_mail_search(page: Any, email: str, timeout_error_type: type[Exception]) -> None:
+    search_url = f"https://mail.naver.com/v2/folders/-1/search?body={quote(email, safe='')}"
+    goto_page(page, search_url, timeout_error_type)
+    ensure_mail_accessible(page)
+    wait_for_mail_search(page)
+
+
+def ensure_mail_accessible(page: Any) -> None:
+    current_url = (page.url or "").casefold()
+    if "nid.naver.com" in current_url or "nidlogin" in current_url:
+        raise CommentCaptureError("네이버 로그인이 필요합니다. '네이버 로그인 열기'로 로그인한 뒤 다시 시도해 주세요.")
+
+
+def wait_for_mail_search(page: Any, timeout_ms: int = 15_000) -> None:
+    deadline = _dt.datetime.now() + _dt.timedelta(milliseconds=timeout_ms)
+    while _dt.datetime.now() < deadline:
+        if collect_mail_entries(page):
+            return
+        page.wait_for_timeout(600)
+
+
+def collect_mail_entries(page: Any) -> list[dict[str, Any]]:
+    try:
+        entries = page.evaluate(
+            """
+            () => {
+              const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+              const pick = (root, selectors) => {
+                for (const selector of selectors) {
+                  const node = root.querySelector(selector);
+                  const text = clean(node && (node.innerText || node.textContent));
+                  if (text) return text;
+                }
+                return '';
+              };
+              const nodes = Array.from(document.querySelectorAll('li.mail_item.read[class*="mail-"], li.mail_item[class*="mail-"]'));
+              const seen = new Set();
+              return nodes.map((el) => {
+                const className = String(el.className || '');
+                const match = className.match(/(?:^|\\s)mail-(\\d+)(?=\\s|$)/);
+                if (!match) return null;
+                const mailId = match[1];
+                if (seen.has(mailId)) return null;
+                seen.add(mailId);
+                const text = clean(el.innerText || el.textContent);
+                return {
+                  mail_id: mailId,
+                  sender: pick(el, ['.sender', '.mail_sender', '.name', '[class*="sender"]', '[class*="from"]']),
+                  subject: pick(el, ['.subject', '.mail_title', '.title', 'strong', '[class*="subject"]', '[class*="title"]']),
+                  date: pick(el, ['.date', '.mail_date', '.time', '[class*="date"]', '[class*="time"]']),
+                  preview: pick(el, ['.preview', '.mail_preview', '.summary', '[class*="preview"]', '[class*="summary"]']) || text,
+                  text
+                };
+              }).filter(Boolean);
+            }
+            """
+        )
+    except Exception:
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for entry in entries or []:
+        preview = compact_text(entry.get("preview", "") or entry.get("text", ""))
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        normalized.append(
+            {
+                "mail_id": compact_text(entry.get("mail_id", "")),
+                "sender": compact_text(entry.get("sender", "")),
+                "subject": compact_text(entry.get("subject", "")),
+                "date": compact_text(entry.get("date", "")),
+                "preview": preview,
+            }
+        )
+    return [entry for entry in normalized if entry["mail_id"]]
+
+
+def make_mail_output_path(output_dir: Path, email: str, mail_id: str) -> Path:
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"mail_{sanitize_filename(email)}_{sanitize_filename(mail_id)}_{timestamp}.png"
+    path = output_dir / filename
+    counter = 2
+    while path.exists():
+        path = output_dir / f"{path.stem}_{counter}{path.suffix}"
+        counter += 1
+    return path
+
+
+def capture_mail_body(page: Any, output_path: Path) -> None:
+    selectors = [
+        ".mail_view_contents",
+        ".mail_view_body",
+        ".mail_body",
+        ".read_body",
+        ".viewer_body",
+        ".content_body",
+        "[class*='mail'][class*='body']",
+        "[class*='read'][class*='body']",
+        "article",
+        "main",
+    ]
+    deadline = _dt.datetime.now() + _dt.timedelta(seconds=12)
+    while _dt.datetime.now() < deadline:
+        candidates: list[tuple[float, Any]] = []
+        for frame in page.frames:
+            for selector in selectors:
+                try:
+                    handles = frame.query_selector_all(selector)
+                except Exception:
+                    continue
+                for handle in handles:
+                    try:
+                        box = handle.bounding_box()
+                    except Exception:
+                        box = None
+                    if box and box.get("width", 0) > 150 and box.get("height", 0) > 80:
+                        candidates.append((box["width"] * box["height"], handle))
+        if candidates:
+            _, handle = max(candidates, key=lambda item: item[0])
+            handle.scroll_into_view_if_needed(timeout=5_000)
+            page.wait_for_timeout(700)
+            handle.screenshot(path=str(output_path))
+            return
+        page.wait_for_timeout(600)
+
+    page.screenshot(path=str(output_path), full_page=True)
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -604,9 +875,14 @@ class App(tk.Tk):
         self.nickname_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_SAVE_DIR))
         self.status_var = tk.StringVar(value="링크와 닉네임을 입력한 뒤 캡처를 시작하세요.")
+        self.email_status_var = tk.StringVar(value="찾은 이메일: 없음")
 
         self.current_match_mode: str | None = None
         self.current_candidates: list[dict[str, Any]] = []
+        self.last_found_email: str | None = None
+        self.last_found_emails: list[str] = []
+        self.last_comment_text: str = ""
+        self.last_comment_saved_path: Path | None = None
 
         self._build_widgets()
 
@@ -614,7 +890,7 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(5, weight=1)
+        outer.rowconfigure(6, weight=1)
 
         ttk.Label(outer, text="블로그 글 링크").grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
         ttk.Entry(outer, textvariable=self.url_var).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
@@ -639,6 +915,13 @@ class App(tk.Tk):
             state=tk.DISABLED,
         )
         self.capture_selected_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.email_capture_button = ttk.Button(
+            button_bar,
+            text="이메일 본문 캡처",
+            command=self.start_email_capture,
+            state=tk.DISABLED,
+        )
+        self.email_capture_button.pack(side=tk.LEFT, padx=(8, 0))
         self.open_folder_button = ttk.Button(button_bar, text="저장 폴더 열기", command=self.open_output_dir)
         self.open_folder_button.pack(side=tk.LEFT, padx=(8, 0))
 
@@ -647,6 +930,9 @@ class App(tk.Tk):
 
         ttk.Label(outer, textvariable=self.status_var, foreground="#155724").grid(
             row=4, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+        )
+        ttk.Label(outer, textvariable=self.email_status_var, foreground="#0b5394").grid(
+            row=5, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
         )
 
         self.tree = ttk.Treeview(
@@ -666,18 +952,18 @@ class App(tk.Tk):
         self.tree.column("date", width=150, stretch=False)
         self.tree.column("preview", width=360, stretch=True)
         self.tree.column("secret", width=60, anchor=tk.CENTER, stretch=False)
-        self.tree.grid(row=5, column=0, columnspan=3, sticky=tk.NSEW)
+        self.tree.grid(row=6, column=0, columnspan=3, sticky=tk.NSEW)
 
         scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
-        scroll.grid(row=5, column=3, sticky=tk.NS)
+        scroll.grid(row=6, column=3, sticky=tk.NS)
 
         note = (
             "앱 전용 Chrome 프로필을 사용합니다. 첫 사용이면 '네이버 로그인 열기'로 로그인한 뒤 "
             "그 Chrome 창을 그대로 둔 채 캡처를 시작하세요. 비밀댓글은 로그인 계정에서 보이는 경우에만 캡처됩니다."
         )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=720).grid(
-            row=6, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
+            row=7, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
         )
 
     def choose_output_dir(self) -> None:
@@ -705,6 +991,7 @@ class App(tk.Tk):
 
     def start_find_or_capture(self) -> None:
         self.clear_candidates()
+        self.clear_email_state()
         self.current_match_mode = None
         self.start_worker(selected_index=None, forced_match_mode=None)
 
@@ -747,15 +1034,56 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def start_email_capture(self, selected_mail_id: str | None = None) -> None:
+        if not self.last_found_email:
+            messagebox.showinfo(APP_TITLE, "먼저 이메일이 포함된 댓글을 캡처해 주세요.")
+            return
+
+        email = self.last_found_email
+        output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
+        self.set_busy(True)
+        self.status_var.set("네이버 메일에서 이메일을 찾는 중입니다...")
+
+        def progress(message: str) -> None:
+            self.after(0, lambda: self.status_var.set(message))
+
+        def worker() -> None:
+            try:
+                result = run_mail_capture(
+                    email=email,
+                    output_dir=output_dir,
+                    selected_mail_id=selected_mail_id,
+                    progress=progress,
+                )
+                self.after(0, lambda: self.handle_mail_result(result))
+            except Exception as exc:
+                details = str(exc)
+                if not isinstance(exc, CommentCaptureError):
+                    details = f"{details}\n\n{traceback.format_exc()}"
+                self.after(0, lambda: self.handle_error(details))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def handle_result(self, result: CaptureResult) -> None:
         self.set_busy(False)
         if result.status == "captured" and result.saved_path:
             self.clear_candidates()
-            self.status_var.set(f"저장 완료: {result.saved_path}")
-            messagebox.showinfo(APP_TITLE, f"댓글 캡처를 저장했습니다.\n\n{result.saved_path}")
+            self.update_email_state(result)
+            self.status_var.set(f"댓글 저장 완료: {result.saved_path}")
+            if result.email:
+                messagebox.showinfo(
+                    APP_TITLE,
+                    f"댓글 캡처를 저장했습니다.\n\n{result.saved_path}\n\n찾은 이메일: {result.email}",
+                )
+            else:
+                messagebox.showinfo(
+                    APP_TITLE,
+                    f"댓글 캡처를 저장했습니다.\n\n{result.saved_path}\n\n댓글에서 이메일을 찾지 못했습니다.",
+                )
             return
 
         if result.status == "multiple" and result.candidates:
+            self.clear_email_state()
             self.current_candidates = result.candidates
             self.current_match_mode = result.match_mode
             self.populate_candidates(result.candidates)
@@ -766,6 +1094,20 @@ class App(tk.Tk):
 
         self.status_var.set("작업을 완료했지만 저장된 파일이 없습니다.")
 
+    def handle_mail_result(self, result: MailCaptureResult) -> None:
+        self.set_busy(False)
+        if result.status == "captured" and result.saved_path:
+            self.status_var.set(f"메일 본문 저장 완료: {result.saved_path}")
+            messagebox.showinfo(APP_TITLE, f"메일 본문 캡처를 저장했습니다.\n\n{result.saved_path}")
+            return
+
+        if result.status == "multiple" and result.candidates:
+            self.status_var.set(f"{result.email} 검색 결과 {len(result.candidates)}개를 찾았습니다. 메일을 선택하세요.")
+            self.show_mail_choice_dialog(result.email, result.candidates)
+            return
+
+        self.status_var.set("메일 캡처를 완료했지만 저장된 파일이 없습니다.")
+
     def handle_error(self, details: str) -> None:
         self.set_busy(False)
         self.status_var.set("오류가 발생했습니다.")
@@ -775,6 +1117,7 @@ class App(tk.Tk):
         state = tk.DISABLED if busy else tk.NORMAL
         self.start_button.configure(state=state)
         self.login_button.configure(state=state)
+        self.email_capture_button.configure(state=tk.DISABLED if busy or not self.last_found_email else tk.NORMAL)
         self.open_folder_button.configure(state=state)
         if busy:
             self.capture_selected_button.configure(state=tk.DISABLED)
@@ -783,12 +1126,111 @@ class App(tk.Tk):
             self.progress.stop()
             if self.current_candidates:
                 self.capture_selected_button.configure(state=tk.NORMAL)
+            if self.last_found_email:
+                self.email_capture_button.configure(state=tk.NORMAL)
 
     def clear_candidates(self) -> None:
         self.current_candidates = []
         self.capture_selected_button.configure(state=tk.DISABLED)
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+    def clear_email_state(self) -> None:
+        self.last_found_email = None
+        self.last_found_emails = []
+        self.last_comment_text = ""
+        self.last_comment_saved_path = None
+        self.email_status_var.set("찾은 이메일: 없음")
+        self.email_capture_button.configure(state=tk.DISABLED)
+
+    def update_email_state(self, result: CaptureResult) -> None:
+        self.last_found_email = result.email
+        self.last_found_emails = result.emails or []
+        self.last_comment_text = result.comment_text or ""
+        self.last_comment_saved_path = result.comment_saved_path or result.saved_path
+        if result.email:
+            if len(self.last_found_emails) > 1:
+                all_emails = ", ".join(self.last_found_emails)
+                self.email_status_var.set(f"찾은 이메일: {result.email} (전체: {all_emails})")
+            else:
+                self.email_status_var.set(f"찾은 이메일: {result.email}")
+            self.email_capture_button.configure(state=tk.NORMAL)
+        else:
+            self.email_status_var.set("찾은 이메일: 없음")
+            self.email_capture_button.configure(state=tk.DISABLED)
+
+    def show_mail_choice_dialog(self, email: str, candidates: list[dict[str, Any]]) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("메일 선택")
+        dialog.geometry("820x420")
+        dialog.minsize(720, 360)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+
+        ttk.Label(frame, text=f"'{email}' 검색 결과가 여러 개입니다. 캡처할 메일을 선택하세요.").grid(
+            row=0, column=0, sticky=tk.EW, pady=(0, 8)
+        )
+
+        tree = ttk.Treeview(
+            frame,
+            columns=("mail_id", "sender", "subject", "date", "preview"),
+            show="headings",
+            selectmode="browse",
+            height=10,
+        )
+        tree.heading("mail_id", text="mailId")
+        tree.heading("sender", text="보낸 사람")
+        tree.heading("subject", text="제목")
+        tree.heading("date", text="날짜")
+        tree.heading("preview", text="미리보기")
+        tree.column("mail_id", width=90, stretch=False)
+        tree.column("sender", width=130, stretch=False)
+        tree.column("subject", width=220, stretch=True)
+        tree.column("date", width=120, stretch=False)
+        tree.column("preview", width=240, stretch=True)
+        tree.grid(row=1, column=0, sticky=tk.NSEW)
+
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.grid(row=1, column=1, sticky=tk.NS)
+
+        for candidate in candidates:
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    candidate.get("mail_id", ""),
+                    candidate.get("sender", ""),
+                    candidate.get("subject", ""),
+                    candidate.get("date", ""),
+                    candidate.get("preview", ""),
+                ),
+            )
+
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0])
+            tree.focus(first[0])
+
+        button_bar = ttk.Frame(frame)
+        button_bar.grid(row=2, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
+
+        def capture_selected() -> None:
+            selected = tree.selection()
+            if not selected:
+                messagebox.showinfo(APP_TITLE, "캡처할 메일을 선택해 주세요.", parent=dialog)
+                return
+            mail_id = tree.set(selected[0], "mail_id")
+            dialog.destroy()
+            self.start_email_capture(selected_mail_id=mail_id)
+
+        ttk.Button(button_bar, text="선택 메일 캡처", command=capture_selected).pack(side=tk.LEFT)
+        ttk.Button(button_bar, text="취소", command=dialog.destroy).pack(side=tk.LEFT, padx=(8, 0))
 
     def populate_candidates(self, candidates: list[dict[str, Any]]) -> None:
         self.clear_candidates()
