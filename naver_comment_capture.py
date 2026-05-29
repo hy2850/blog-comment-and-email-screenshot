@@ -271,7 +271,7 @@ def first_query_value(query: dict[str, list[str]], key: str) -> str:
     return values[0].strip() if values else ""
 
 
-def is_automation_chrome_running() -> bool:
+def chrome_command_lines() -> list[str]:
     try:
         completed = subprocess.run(
             [
@@ -289,9 +289,21 @@ def is_automation_chrome_running() -> bool:
             check=False,
         )
     except Exception:
-        return False
+        return []
+    return [line for line in (completed.stdout or "").splitlines() if line.strip()]
+
+
+def is_automation_chrome_running() -> bool:
+    return any(is_app_chrome_command_line(command_line) for command_line in chrome_command_lines())
+
+
+def is_app_chrome_command_line(command_line: str) -> bool:
+    command = (command_line or "").casefold()
     expected = str(CHROME_USER_DATA_DIR).casefold()
-    return expected in (completed.stdout or "").casefold()
+    has_current_profile = expected in command
+    has_debug_port = f"--remote-debugging-port={CDP_PORT}" in command
+    has_app_profile = "chrome-profile" in command
+    return has_current_profile or (has_debug_port and has_app_profile)
 
 
 def ensure_local_environment() -> Path:
@@ -311,16 +323,59 @@ def open_login_profile() -> None:
         [
             str(chrome_exe),
             f"--user-data-dir={CHROME_USER_DATA_DIR}",
-            f"--remote-debugging-port={CDP_PORT}",
-            "--remote-debugging-address=127.0.0.1",
-            "--no-first-run",
-            "--disable-session-crashed-bubble",
+            *chrome_launch_args(),
             "--new-window",
             LOGIN_URL,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def open_or_connect_chrome_context(
+    playwright: Any,
+    chrome_exe: Path,
+    viewport: dict[str, int],
+    report: Callable[[str], None],
+    launch_error_message: str,
+) -> tuple[Any, bool, Any | None]:
+    if is_automation_chrome_running():
+        report("열려 있는 로그인/캡처용 Chrome에 연결하는 중...")
+        try:
+            browser = playwright.chromium.connect_over_cdp(CDP_URL, timeout=10_000)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            return context, False, browser
+        except Exception as exc:
+            raise CommentCaptureError(
+                "열려 있는 로그인/캡처용 Chrome에 연결하지 못했습니다. "
+                "열려 있는 로그인/캡처용 Chrome 창을 모두 닫고 다시 시도해 주세요."
+            ) from exc
+
+    report("Chrome 프로필을 여는 중...")
+    try:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(CHROME_USER_DATA_DIR),
+            executable_path=str(chrome_exe),
+            headless=False,
+            viewport=viewport,
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+            timeout=30_000,
+            args=chrome_launch_args(),
+        )
+        return context, True, None
+    except Exception as exc:
+        raise CommentCaptureError(launch_error_message) from exc
+
+
+def chrome_launch_args() -> list[str]:
+    return [
+        f"--remote-debugging-port={CDP_PORT}",
+        "--remote-debugging-address=127.0.0.1",
+        "--no-first-run",
+        "--disable-session-crashed-bubble",
+        "--disable-blink-features=AutomationControlled",
+    ]
 
 
 def ensure_chrome_exists() -> Path:
@@ -455,41 +510,17 @@ def run_capture(
     close_context_when_done = False
     with sync_playwright() as playwright:
         try:
-            if is_automation_chrome_running():
-                report("열려 있는 로그인 Chrome에 연결하는 중...")
-                try:
-                    browser = playwright.chromium.connect_over_cdp(CDP_URL, timeout=10_000)
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                except Exception as exc:
-                    raise CommentCaptureError(
-                        "열려 있는 로그인용 Chrome에 연결하지 못했습니다. "
-                        "이전 버전으로 열린 Chrome 창일 수 있으니 닫고, '네이버 로그인 열기'를 다시 눌러 로그인해 주세요."
-                    ) from exc
-            else:
-                report("Chrome 프로필을 여는 중...")
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(CHROME_USER_DATA_DIR),
-                    executable_path=str(chrome_exe),
-                    headless=False,
-                    viewport={"width": 390, "height": 844},
-                    locale="ko-KR",
-                    timezone_id="Asia/Seoul",
-                    timeout=30_000,
-                    args=[
-                        f"--remote-debugging-port={CDP_PORT}",
-                        "--remote-debugging-address=127.0.0.1",
-                        "--no-first-run",
-                        "--disable-session-crashed-bubble",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                close_context_when_done = True
+            context, close_context_when_done, browser = open_or_connect_chrome_context(
+                playwright=playwright,
+                chrome_exe=chrome_exe,
+                viewport={"width": 390, "height": 844},
+                report=report,
+                launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.",
+            )
         except Exception as exc:
             if isinstance(exc, CommentCaptureError):
                 raise
-            raise CommentCaptureError(
-                "앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요."
-            ) from exc
+            raise CommentCaptureError("앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.") from exc
 
         try:
             report("첫 번째 Chrome 탭을 준비하는 중...")
@@ -838,43 +869,21 @@ def run_mail_capture(
         ) from exc
 
     context = None
+    browser = None
     close_context_when_done = False
     with sync_playwright() as playwright:
         try:
-            if is_automation_chrome_running():
-                report("열려 있는 로그인 Chrome에 연결하는 중...")
-                try:
-                    browser = playwright.chromium.connect_over_cdp(CDP_URL, timeout=10_000)
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                except Exception as exc:
-                    raise CommentCaptureError(
-                        "열려 있는 로그인용 Chrome에 연결하지 못했습니다. 로그인/캡처용 Chrome 창을 닫고 다시 시도해 주세요."
-                    ) from exc
-            else:
-                report("Chrome 프로필을 여는 중...")
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=str(CHROME_USER_DATA_DIR),
-                    executable_path=str(chrome_exe),
-                    headless=False,
-                    viewport={"width": 1100, "height": 900},
-                    locale="ko-KR",
-                    timezone_id="Asia/Seoul",
-                    timeout=30_000,
-                    args=[
-                        f"--remote-debugging-port={CDP_PORT}",
-                        "--remote-debugging-address=127.0.0.1",
-                        "--no-first-run",
-                        "--disable-session-crashed-bubble",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                close_context_when_done = True
+            context, close_context_when_done, browser = open_or_connect_chrome_context(
+                playwright=playwright,
+                chrome_exe=chrome_exe,
+                viewport={"width": 1100, "height": 900},
+                report=report,
+                launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 로그인용 Chrome 창을 닫고 다시 실행해 주세요.",
+            )
         except Exception as exc:
             if isinstance(exc, CommentCaptureError):
                 raise
-            raise CommentCaptureError(
-                "앱 전용 Chrome 프로필을 열지 못했습니다. 로그인용 Chrome 창을 닫고 다시 실행해 주세요."
-            ) from exc
+            raise CommentCaptureError("앱 전용 Chrome 프로필을 열지 못했습니다. 로그인용 Chrome 창을 닫고 다시 실행해 주세요.") from exc
 
         try:
             page = get_mail_page(context)

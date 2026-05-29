@@ -38,6 +38,9 @@ goto end
 echo.
 echo Failed to build executable. Check the message above.
 pause
+endlocal
+exit /b 1
 
 :end
 endlocal
+exit /b 0
