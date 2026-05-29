@@ -1192,6 +1192,7 @@ class App(tk.Tk):
         self.last_found_emails: list[str] = []
         self.last_comment_text: str = ""
         self.last_comment_saved_path: Path | None = None
+        self.is_busy = False
 
         self._build_widgets()
 
@@ -1205,7 +1206,7 @@ class App(tk.Tk):
         ttk.Entry(outer, textvariable=self.url_var).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
 
         ttk.Label(outer, text="닉네임").grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.nickname_var, width=30).grid(row=1, column=1, sticky=tk.EW, pady=(0, 8))
+        ttk.Entry(outer, textvariable=self.nickname_var).grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
 
         ttk.Label(outer, text="이메일 (댓글에서 자동 추출 or 직접입력)").grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
         ttk.Entry(outer, textvariable=self.email_var).grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
@@ -1220,13 +1221,6 @@ class App(tk.Tk):
         self.start_button.pack(side=tk.LEFT)
         self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
         self.login_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.capture_selected_button = ttk.Button(
-            button_bar,
-            text="선택 댓글 캡처",
-            command=self.capture_selected_candidate,
-            state=tk.DISABLED,
-        )
-        self.capture_selected_button.pack(side=tk.LEFT, padx=(8, 0))
         self.email_capture_button = ttk.Button(
             button_bar,
             text="이메일 본문 캡처",
@@ -1264,6 +1258,8 @@ class App(tk.Tk):
         self.tree.column("preview", width=360, stretch=True)
         self.tree.column("secret", width=60, anchor=tk.CENTER, stretch=False)
         self.tree.grid(row=7, column=0, columnspan=3, sticky=tk.NSEW)
+        self.tree.bind("<Double-1>", self.capture_selected_candidate)
+        self.tree.bind("<Return>", self.capture_selected_candidate)
 
         scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -1306,7 +1302,11 @@ class App(tk.Tk):
         self.current_match_mode = None
         self.start_worker(selected_index=None, forced_match_mode=None)
 
-    def capture_selected_candidate(self) -> None:
+    def capture_selected_candidate(self, event: tk.Event | None = None) -> None:
+        if self.is_busy:
+            return
+        if not self.current_candidates:
+            return
         selected_items = self.tree.selection()
         if not selected_items:
             messagebox.showinfo(APP_TITLE, "캡처할 댓글 후보를 선택해 주세요.")
@@ -1401,9 +1401,8 @@ class App(tk.Tk):
             self.current_candidates = result.candidates
             self.current_match_mode = result.match_mode
             self.populate_candidates(result.candidates)
-            self.capture_selected_button.configure(state=tk.NORMAL)
             mode_label = "정확 일치" if result.match_mode == "exact" else "부분 일치"
-            self.status_var.set(f"{mode_label} 후보 {len(result.candidates)}개를 찾았습니다. 캡처할 댓글을 선택하세요.")
+            self.status_var.set(f"{mode_label} 후보 {len(result.candidates)}개를 찾았습니다. 목록에서 캡처할 댓글을 더블클릭하세요.")
             return
 
         self.status_var.set("작업을 완료했지만 저장된 파일이 없습니다.")
@@ -1428,23 +1427,20 @@ class App(tk.Tk):
         messagebox.showerror(APP_TITLE, details)
 
     def set_busy(self, busy: bool) -> None:
+        self.is_busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         self.start_button.configure(state=state)
         self.login_button.configure(state=state)
         self.email_capture_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.open_folder_button.configure(state=state)
         if busy:
-            self.capture_selected_button.configure(state=tk.DISABLED)
             self.progress.start(12)
         else:
             self.progress.stop()
-            if self.current_candidates:
-                self.capture_selected_button.configure(state=tk.NORMAL)
             self.email_capture_button.configure(state=tk.NORMAL)
 
     def clear_candidates(self) -> None:
         self.current_candidates = []
-        self.capture_selected_button.configure(state=tk.DISABLED)
         for item in self.tree.get_children():
             self.tree.delete(item)
 
