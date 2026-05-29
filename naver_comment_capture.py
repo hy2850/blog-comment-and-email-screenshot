@@ -5,6 +5,7 @@ import datetime as _dt
 import os
 import re
 import subprocess
+import sys
 import threading
 import traceback
 from dataclasses import dataclass
@@ -17,15 +18,16 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "네이버 블로그 댓글 캡처"
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 DEFAULT_SAVE_DIR = Path.home() / "Downloads" / "naver-comment-captures"
-LOG_PATH = Path(__file__).with_name("naver_comment_capture.log")
-CHROME_EXE = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+LOG_PATH = APP_DIR / "naver_comment_capture.log"
 CHROME_USER_DATA_DIR = APP_DIR / "chrome-profile"
 LOGIN_URL = "https://nid.naver.com/nidlogin.login"
 CDP_PORT = 9222
 CDP_URL = f"http://127.0.0.1:{CDP_PORT}"
 EMAIL_PATTERN = re.compile(r"[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}", re.IGNORECASE)
+_CHROME_EXE_CACHE: Path | None = None
+_CHROME_CANDIDATES_CHECKED: list[Path] = []
 
 COMMENT_CONTAINER_SELECTORS = [
     ".u_cbox_comment_box",
@@ -292,13 +294,14 @@ def is_automation_chrome_running() -> bool:
     return expected in (completed.stdout or "").casefold()
 
 
-def ensure_local_environment() -> None:
-    ensure_chrome_exists()
+def ensure_local_environment() -> Path:
+    chrome_exe = ensure_chrome_exists()
     CHROME_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    return chrome_exe
 
 
 def open_login_profile() -> None:
-    ensure_chrome_exists()
+    chrome_exe = ensure_chrome_exists()
     CHROME_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
     if is_automation_chrome_running():
         raise CommentCaptureError(
@@ -306,7 +309,7 @@ def open_login_profile() -> None:
         )
     subprocess.Popen(
         [
-            str(CHROME_EXE),
+            str(chrome_exe),
             f"--user-data-dir={CHROME_USER_DATA_DIR}",
             f"--remote-debugging-port={CDP_PORT}",
             "--remote-debugging-address=127.0.0.1",
@@ -320,9 +323,101 @@ def open_login_profile() -> None:
     )
 
 
-def ensure_chrome_exists() -> None:
-    if not CHROME_EXE.exists():
-        raise CommentCaptureError(f"Chrome 실행 파일을 찾지 못했습니다: {CHROME_EXE}")
+def ensure_chrome_exists() -> Path:
+    chrome_exe = find_chrome_exe()
+    if chrome_exe:
+        return chrome_exe
+    checked = "\n".join(f"- {path}" for path in _CHROME_CANDIDATES_CHECKED)
+    raise CommentCaptureError(
+        "Chrome 실행 파일을 찾지 못했습니다.\n\n"
+        "Chrome을 설치한 뒤 다시 실행해 주세요. 확인한 경로:\n"
+        f"{checked or '- 후보 경로 없음'}"
+    )
+
+
+def find_chrome_exe() -> Path | None:
+    global _CHROME_EXE_CACHE, _CHROME_CANDIDATES_CHECKED
+
+    if _CHROME_EXE_CACHE and _CHROME_EXE_CACHE.is_file():
+        return _CHROME_EXE_CACHE
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in chrome_path_candidates():
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+
+    _CHROME_CANDIDATES_CHECKED = candidates
+    for candidate in candidates:
+        if candidate.is_file():
+            _CHROME_EXE_CACHE = candidate
+            return candidate
+    _CHROME_EXE_CACHE = None
+    return None
+
+
+def chrome_path_candidates() -> list[Path]:
+    candidates: list[Path] = []
+
+    def add(path: str | Path | None) -> None:
+        if path:
+            candidates.append(Path(path).expanduser())
+
+    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LocalAppData"):
+        base = os.environ.get(env_name)
+        if base:
+            add(Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe")
+
+    user_profile = os.environ.get("UserProfile")
+    if user_profile:
+        add(Path(user_profile) / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe")
+
+    add(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    add(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe")
+
+    candidates.extend(registry_chrome_candidates())
+    candidates.extend(where_chrome_candidates())
+    return candidates
+
+
+def registry_chrome_candidates() -> list[Path]:
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    paths: list[Path] = []
+    subkeys = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+    )
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for subkey in subkeys:
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, None)
+                    if value:
+                        paths.append(Path(value))
+            except OSError:
+                continue
+    return paths
+
+
+def where_chrome_candidates() -> list[Path]:
+    try:
+        completed = subprocess.run(
+            ["where", "chrome"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return []
+    return [Path(line.strip()) for line in completed.stdout.splitlines() if line.strip()]
 
 
 def run_capture(
@@ -344,7 +439,7 @@ def run_capture(
         raise CommentCaptureError("찾을 닉네임을 입력해 주세요.")
 
     report("환경 확인 중...")
-    ensure_local_environment()
+    chrome_exe = ensure_local_environment()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -374,7 +469,7 @@ def run_capture(
                 report("Chrome 프로필을 여는 중...")
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(CHROME_USER_DATA_DIR),
-                    executable_path=str(CHROME_EXE),
+                    executable_path=str(chrome_exe),
                     headless=False,
                     viewport={"width": 390, "height": 844},
                     locale="ko-KR",
@@ -731,7 +826,7 @@ def run_mail_capture(
         raise CommentCaptureError("먼저 댓글에서 이메일을 찾아야 합니다.")
 
     report("메일 캡처 환경 확인 중...")
-    ensure_local_environment()
+    chrome_exe = ensure_local_environment()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -759,7 +854,7 @@ def run_mail_capture(
                 report("Chrome 프로필을 여는 중...")
                 context = playwright.chromium.launch_persistent_context(
                     user_data_dir=str(CHROME_USER_DATA_DIR),
-                    executable_path=str(CHROME_EXE),
+                    executable_path=str(chrome_exe),
                     headless=False,
                     viewport={"width": 1100, "height": 900},
                     locale="ko-KR",

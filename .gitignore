@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
+
+build/
+dist/
 
 chrome-profile/
 naver_comment_capture.log
@@ -9,3 +13,8 @@ naver_comment_capture.log
 *.jpg
 *.jpeg
 *.webp
+
+!release/
+!release/**
+release/NaverCommentCapture/chrome-profile/
+release/NaverCommentCapture/naver_comment_capture.log
