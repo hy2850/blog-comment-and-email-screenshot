@@ -826,20 +826,32 @@ def make_mail_output_path(output_dir: Path, email: str, mail_id: str) -> Path:
 
 def capture_mail_body(page: Any, output_path: Path) -> None:
     selectors = [
+        "#mail_read",
+        "#readFrame",
+        ".mail_view",
         ".mail_view_contents",
+        ".mail_view_content",
         ".mail_view_body",
+        ".mail_viewer",
         ".mail_body",
         ".read_body",
+        ".read_content",
         ".viewer_body",
         ".content_body",
+        ".mail_contents",
+        ".mail_content",
+        ".view_content",
         "[class*='mail'][class*='body']",
+        "[class*='mail'][class*='content']",
         "[class*='read'][class*='body']",
+        "[class*='read'][class*='content']",
         "article",
         "main",
     ]
+    scroll_mail_to_bottom(page)
     deadline = _dt.datetime.now() + _dt.timedelta(seconds=12)
     while _dt.datetime.now() < deadline:
-        candidates: list[tuple[float, Any]] = []
+        candidates: list[tuple[float, float, Any]] = []
         for frame in page.frames:
             for selector in selectors:
                 try:
@@ -848,20 +860,145 @@ def capture_mail_body(page: Any, output_path: Path) -> None:
                     continue
                 for handle in handles:
                     try:
-                        box = handle.bounding_box()
+                        metrics = handle.evaluate(
+                            """
+                            (el) => {
+                              const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                              const box = el.getBoundingClientRect();
+                              const images = el.querySelectorAll('img').length;
+                              return {
+                                width: Math.max(box.width, el.scrollWidth || 0, el.offsetWidth || 0),
+                                height: Math.max(box.height, el.scrollHeight || 0, el.offsetHeight || 0),
+                                textLength: text.length,
+                                images,
+                                childCount: el.children.length
+                              };
+                            }
+                            """
+                        )
                     except Exception:
-                        box = None
-                    if box and box.get("width", 0) > 150 and box.get("height", 0) > 80:
-                        candidates.append((box["width"] * box["height"], handle))
+                        metrics = None
+                    if not metrics:
+                        continue
+                    width = float(metrics.get("width") or 0)
+                    height = float(metrics.get("height") or 0)
+                    text_length = float(metrics.get("textLength") or 0)
+                    image_count = float(metrics.get("images") or 0)
+                    child_count = float(metrics.get("childCount") or 0)
+                    if width < 150 or height < 80:
+                        continue
+                    if text_length < 5 and image_count == 0 and child_count < 2:
+                        continue
+                    content_score = text_length + image_count * 200 + child_count * 15
+                    # Prefer content-rich containers, then the tighter box to avoid huge blank wrappers.
+                    tightness_score = -height if height > 1600 and content_score < 800 else -abs(height - min(height, 2200))
+                    candidates.append((content_score, tightness_score, handle))
         if candidates:
-            _, handle = max(candidates, key=lambda item: item[0])
+            _, _, handle = max(candidates, key=lambda item: (item[0], item[1]))
             handle.scroll_into_view_if_needed(timeout=5_000)
             page.wait_for_timeout(700)
-            handle.screenshot(path=str(output_path))
+            screenshot_full_element(handle, page, output_path)
             return
         page.wait_for_timeout(600)
 
     page.screenshot(path=str(output_path), full_page=True)
+
+
+def scroll_mail_to_bottom(page: Any) -> None:
+    scrollable_selectors = [
+        ".mail_view_contents",
+        ".mail_view_body",
+        ".mail_body",
+        ".read_body",
+        ".viewer_body",
+        ".content_body",
+        "[class*='mail'][class*='body']",
+        "[class*='read'][class*='body']",
+        "main",
+        "body",
+        "html",
+    ]
+    previous_state = None
+    stable_count = 0
+    for _ in range(24):
+        state = page.evaluate(
+            """
+            (selectors) => {
+              const scrolled = [];
+              for (const selector of selectors) {
+                for (const el of Array.from(document.querySelectorAll(selector))) {
+                  const maxScroll = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+                  if (maxScroll > 0) {
+                    el.scrollTop = maxScroll;
+                    scrolled.push(`${selector}:${Math.round(el.scrollTop)}/${Math.round(el.scrollHeight)}`);
+                  }
+                }
+              }
+              window.scrollTo(0, Math.max(document.body.scrollHeight, document.documentElement.scrollHeight));
+              return [
+                window.scrollY,
+                document.body.scrollHeight,
+                document.documentElement.scrollHeight,
+                scrolled.join('|')
+              ].join(':');
+            }
+            """,
+            scrollable_selectors,
+        )
+        page.wait_for_timeout(500)
+        if state == previous_state:
+            stable_count += 1
+            if stable_count >= 3:
+                break
+        else:
+            stable_count = 0
+            previous_state = state
+    page.evaluate(
+        """
+        (selectors) => {
+          for (const selector of selectors) {
+            for (const el of Array.from(document.querySelectorAll(selector))) {
+              if ((el.scrollHeight || 0) > (el.clientHeight || 0)) {
+                el.scrollTop = 0;
+              }
+            }
+          }
+          window.scrollTo(0, 0);
+        }
+        """,
+        scrollable_selectors,
+    )
+    page.wait_for_timeout(500)
+
+
+def screenshot_full_element(handle: Any, page: Any, output_path: Path) -> None:
+    try:
+        metrics = handle.evaluate(
+            """
+            (el) => {
+              const rect = el.getBoundingClientRect();
+              return {
+                width: Math.ceil(Math.max(rect.width, el.scrollWidth || 0, el.offsetWidth || 0)),
+                height: Math.ceil(Math.max(rect.height, el.scrollHeight || 0, el.offsetHeight || 0))
+              };
+            }
+            """
+        )
+    except Exception:
+        metrics = {}
+
+    width = int(metrics.get("width") or 0)
+    height = int(metrics.get("height") or 0)
+    if width > 0 and height > 0:
+        viewport = page.viewport_size or {"width": 1100, "height": 900}
+        page.set_viewport_size(
+            {
+                "width": max(int(viewport.get("width") or 1100), min(width + 80, 2000)),
+                "height": max(int(viewport.get("height") or 900), min(height + 160, 16000)),
+            }
+        )
+        page.wait_for_timeout(400)
+    handle.screenshot(path=str(output_path))
 
 
 class App(tk.Tk):
