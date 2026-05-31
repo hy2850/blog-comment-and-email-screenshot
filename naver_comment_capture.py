@@ -178,6 +178,17 @@ def extract_emails(value: str) -> list[str]:
     return emails
 
 
+def find_preferred_mail_entry(entries: list[dict[str, Any]], subject_keyword: str) -> dict[str, Any] | None:
+    keyword = compact_text(subject_keyword).casefold()
+    if not keyword:
+        return None
+    for entry in entries:
+        subject = compact_text(str(entry.get("subject", ""))).casefold()
+        if keyword in subject:
+            return entry
+    return None
+
+
 def write_log(message: str) -> None:
     timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -1227,6 +1238,7 @@ def run_mail_capture(
     email: str,
     output_dir: Path,
     selected_mail_id: str | None = None,
+    preferred_subject_keyword: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> MailCaptureResult:
     def report(message: str) -> None:
@@ -1282,8 +1294,16 @@ def run_mail_capture(
                         f"'{email}'로 검색된 메일을 찾지 못했습니다. 네이버 메일 로그인 상태와 검색 결과를 확인해 주세요."
                     )
                 if len(entries) > 1:
-                    return MailCaptureResult(status="multiple", email=email, candidates=entries)
-                mail_id = entries[0]["mail_id"]
+                    preferred_entry = find_preferred_mail_entry(entries, preferred_subject_keyword)
+                    if preferred_entry:
+                        mail_id = preferred_entry["mail_id"]
+                        report("제목 키워드와 일치하는 메일을 선택했습니다.")
+                    else:
+                        if compact_text(preferred_subject_keyword):
+                            report("제목 키워드와 일치하는 메일이 없어 선택 창을 표시합니다.")
+                        return MailCaptureResult(status="multiple", email=email, candidates=entries)
+                else:
+                    mail_id = entries[0]["mail_id"]
 
             report("메일 본문을 여는 중...")
             read_url = f"https://mail.naver.com/v2/popup/read/1/{mail_id}"
@@ -1666,6 +1686,7 @@ class App(tk.Tk):
         self.minsize(720, 500)
 
         self.url_var = tk.StringVar(value="https://m.blog.naver.com/shuchel/224296188790")
+        self.subject_keyword_var = tk.StringVar()
         self.nickname_var = tk.StringVar()
         self.email_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_SAVE_DIR))
@@ -1680,6 +1701,7 @@ class App(tk.Tk):
         self.mail_batch_saved_paths: list[Path] = []
         self.mail_batch_failures: list[str] = []
         self.mail_batch_skipped: list[str] = []
+        self.mail_batch_subject_keyword = ""
         self.last_found_email: str | None = None
         self.last_found_emails: list[str] = []
         self.last_comment_text: str = ""
@@ -1696,14 +1718,23 @@ class App(tk.Tk):
         outer.rowconfigure(5, weight=1)
 
         ttk.Label(outer, text="블로그 글 링크").grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.url_var).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
+        self.url_entry = ttk.Entry(outer, textvariable=self.url_var)
+        self.url_entry.grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
 
-        ttk.Label(outer, text="저장 폴더").grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.output_dir_var).grid(row=1, column=1, sticky=tk.EW, pady=(0, 8))
-        ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir).grid(row=1, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
+        ttk.Label(outer, text="이 키워드를 제목에 포함하는 메일 우선선택").grid(
+            row=1, column=0, sticky=tk.W, pady=(0, 8)
+        )
+        self.subject_keyword_entry = ttk.Entry(outer, textvariable=self.subject_keyword_var)
+        self.subject_keyword_entry.grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
+
+        ttk.Label(outer, text="저장 폴더").grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
+        self.output_dir_entry = ttk.Entry(outer, textvariable=self.output_dir_var)
+        self.output_dir_entry.grid(row=2, column=1, sticky=tk.EW, pady=(0, 8))
+        self.choose_folder_button = ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir)
+        self.choose_folder_button.grid(row=2, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
 
         button_bar = ttk.Frame(outer)
-        button_bar.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
+        button_bar.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
         self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
         self.login_button.pack(side=tk.LEFT)
         self.start_button = ttk.Button(button_bar, text="캡처대상 찾기", command=self.start_find_or_capture)
@@ -1729,7 +1760,7 @@ class App(tk.Tk):
         self.progress.pack(side=tk.RIGHT)
 
         ttk.Label(outer, textvariable=self.status_var, foreground="#155724").grid(
-            row=3, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+            row=4, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
         )
 
         self.tree = ttk.Treeview(
@@ -1853,6 +1884,7 @@ class App(tk.Tk):
         self.mail_batch_saved_paths = []
         self.mail_batch_failures = []
         self.mail_batch_skipped = []
+        self.mail_batch_subject_keyword = compact_text(self.subject_keyword_var.get())
         self.set_busy(True)
         self.process_next_mail_target()
 
@@ -1883,6 +1915,7 @@ class App(tk.Tk):
                     email=email,
                     output_dir=output_dir,
                     selected_mail_id=selected_mail_id,
+                    preferred_subject_keyword=self.mail_batch_subject_keyword,
                     progress=progress,
                 )
                 self.after(0, lambda: self.handle_batch_mail_result(result))
@@ -2028,6 +2061,10 @@ class App(tk.Tk):
     def set_busy(self, busy: bool) -> None:
         self.is_busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
+        self.url_entry.configure(state=state)
+        self.subject_keyword_entry.configure(state=state)
+        self.output_dir_entry.configure(state=state)
+        self.choose_folder_button.configure(state=state)
         self.start_button.configure(state=state)
         self.login_button.configure(state=state)
         self.open_folder_button.configure(state=state)
