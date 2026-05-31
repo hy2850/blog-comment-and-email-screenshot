@@ -1704,8 +1704,10 @@ class App(tk.Tk):
 
         button_bar = ttk.Frame(outer)
         button_bar.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
+        self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
+        self.login_button.pack(side=tk.LEFT)
         self.start_button = ttk.Button(button_bar, text="캡처대상 찾기", command=self.start_find_or_capture)
-        self.start_button.pack(side=tk.LEFT)
+        self.start_button.pack(side=tk.LEFT, padx=(8, 0))
         self.comment_capture_button = ttk.Button(
             button_bar,
             text="댓글 캡처",
@@ -1713,8 +1715,6 @@ class App(tk.Tk):
             state=tk.DISABLED,
         )
         self.comment_capture_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
-        self.login_button.pack(side=tk.LEFT, padx=(8, 0))
         self.email_capture_button = ttk.Button(
             button_bar,
             text="이메일 본문 캡처",
