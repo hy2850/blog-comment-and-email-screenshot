@@ -25,8 +25,10 @@ echo Building executable...
 "%PY%" -m PyInstaller --noconfirm naver_comment_capture.spec
 if errorlevel 1 goto error
 
-if exist "release\NaverCommentCapture" rmdir /s /q "release\NaverCommentCapture"
 if not exist "release" mkdir "release"
+if not exist "release\NaverCommentCapture" mkdir "release\NaverCommentCapture"
+if exist "release\NaverCommentCapture\NaverCommentCapture.exe" del /f /q "release\NaverCommentCapture\NaverCommentCapture.exe"
+if exist "release\NaverCommentCapture\_internal" rmdir /s /q "release\NaverCommentCapture\_internal"
 xcopy /e /i /y "dist\NaverCommentCapture" "release\NaverCommentCapture" >nul
 if errorlevel 1 goto error
 

@@ -1094,13 +1094,17 @@ def build_comment_targets(
     share_marker_index: int | None = None
     share_text = normalize_text("공유 완료")
     for index, row in enumerate(rows):
-        row["index"] = index + 1
+        row["sorted_index"] = index + 1
         if share_text in normalize_text(row["comment_text"]):
             share_marker_index = index
 
     if share_marker_index is not None:
         for index, row in enumerate(rows):
             row["selected"] = index > share_marker_index
+
+    rows = [row for row in rows if row.get("email")]
+    for index, row in enumerate(rows):
+        row["index"] = index + 1
     return rows, (share_marker_index + 1 if share_marker_index is not None else None)
 
 
