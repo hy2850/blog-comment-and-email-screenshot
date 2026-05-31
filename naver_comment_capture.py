@@ -2068,16 +2068,22 @@ class App(tk.Tk):
                 return target
         return None
 
-    def on_target_tree_click(self, event: tk.Event) -> None:
+    def on_target_tree_click(self, event: tk.Event) -> str | None:
         if self.is_busy:
-            return
-        if self.tree.identify("region", event.x, event.y) != "cell":
-            return
-        if self.tree.identify_column(event.x) != "#1":
-            return
+            return None
+        region = self.tree.identify("region", event.x, event.y)
+        column = self.tree.identify_column(event.x)
+        if region == "heading" and column == "#1":
+            self.toggle_all_targets()
+            return "break"
+        if region != "cell":
+            return None
+        if column != "#1":
+            return None
         iid = self.tree.identify_row(event.y)
         if iid:
             self.toggle_target(iid, extend=bool(event.state & 0x0001))
+        return None
 
     def on_target_tree_space(self, event: tk.Event) -> str | None:
         if self.is_busy:
@@ -2116,6 +2122,16 @@ class App(tk.Tk):
             target["selected"] = selected
             self.refresh_target_row(target)
         return True
+
+    def toggle_all_targets(self) -> None:
+        if not self.current_targets:
+            return
+        selected = not all(bool(target.get("selected")) for target in self.current_targets)
+        for target in self.current_targets:
+            target["selected"] = selected
+            self.refresh_target_row(target)
+        self.last_toggled_target_iid = None
+        self.update_selected_count_status()
 
     def update_selected_count_status(self) -> None:
         checked_count = len([item for item in self.current_targets if item.get("selected")])
