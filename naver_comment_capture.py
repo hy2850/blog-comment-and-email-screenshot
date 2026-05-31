@@ -1685,6 +1685,7 @@ class App(tk.Tk):
         self.last_comment_text: str = ""
         self.last_comment_saved_path: Path | None = None
         self.is_busy = False
+        self.last_toggled_target_iid: str | None = None
 
         self._build_widgets()
 
@@ -2052,6 +2053,7 @@ class App(tk.Tk):
         self.mail_batch_saved_paths = []
         self.mail_batch_failures = []
         self.mail_batch_skipped = []
+        self.last_toggled_target_iid = None
         for item in self.tree.get_children():
             self.tree.delete(item)
         self.comment_capture_button.configure(state=tk.DISABLED)
@@ -2075,7 +2077,7 @@ class App(tk.Tk):
             return
         iid = self.tree.identify_row(event.y)
         if iid:
-            self.toggle_target(iid)
+            self.toggle_target(iid, extend=bool(event.state & 0x0001))
 
     def on_target_tree_space(self, event: tk.Event) -> str | None:
         if self.is_busy:
@@ -2085,12 +2087,37 @@ class App(tk.Tk):
             self.toggle_target(selected[0])
         return "break"
 
-    def toggle_target(self, iid: str) -> None:
+    def toggle_target(self, iid: str, extend: bool = False) -> None:
         target = self.target_by_iid(iid)
         if not target:
             return
-        target["selected"] = not bool(target.get("selected"))
+        new_value = not bool(target.get("selected"))
+        if extend and self.last_toggled_target_iid:
+            changed = self.set_target_range_selected(self.last_toggled_target_iid, iid, new_value)
+            if changed:
+                self.update_selected_count_status()
+                self.last_toggled_target_iid = iid
+                return
+
+        target["selected"] = new_value
         self.refresh_target_row(target)
+        self.last_toggled_target_iid = iid
+        self.update_selected_count_status()
+
+    def set_target_range_selected(self, start_iid: str, end_iid: str, selected: bool) -> bool:
+        iids = [str(target.get("row_id")) for target in self.current_targets]
+        if start_iid not in iids or end_iid not in iids:
+            return False
+        start_index = iids.index(start_iid)
+        end_index = iids.index(end_iid)
+        if start_index > end_index:
+            start_index, end_index = end_index, start_index
+        for target in self.current_targets[start_index : end_index + 1]:
+            target["selected"] = selected
+            self.refresh_target_row(target)
+        return True
+
+    def update_selected_count_status(self) -> None:
         checked_count = len([item for item in self.current_targets if item.get("selected")])
         self.status_var.set(f"캡처대상 {checked_count}개 선택됨")
 
