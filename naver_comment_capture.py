@@ -120,6 +120,21 @@ class MailCaptureResult:
     mail_id: str | None = None
 
 
+@dataclass
+class TargetDiscoveryResult:
+    targets: list[dict[str, Any]]
+    total_count: int
+    checked_count: int
+    share_marker_index: int | None = None
+
+
+@dataclass
+class BatchCaptureResult:
+    saved_paths: list[Path]
+    failures: list[str]
+    skipped: list[str] | None = None
+
+
 def compact_text(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
@@ -841,6 +856,369 @@ def capture_entry(page: Any, entry: CommentEntry, output_path: Path) -> None:
     entry.handle.screenshot(path=str(output_path))
 
 
+def run_discover_targets(
+    raw_url: str,
+    progress: Callable[[str], None] | None = None,
+) -> TargetDiscoveryResult:
+    def report(message: str) -> None:
+        write_log(message)
+        if progress:
+            progress(message)
+
+    post = parse_blog_post(raw_url)
+    report("캡처대상 탐색 환경 확인 중...")
+    chrome_exe = ensure_local_environment()
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CommentCaptureError(
+            "Playwright가 설치되어 있지 않습니다. run_naver_comment_capture.bat으로 실행하면 자동 설치됩니다."
+        ) from exc
+
+    context = None
+    browser = None
+    close_context_when_done = False
+    with sync_playwright() as playwright:
+        try:
+            context, close_context_when_done, browser = open_or_connect_chrome_context(
+                playwright=playwright,
+                chrome_exe=chrome_exe,
+                viewport={"width": 390, "height": 844},
+                report=report,
+                launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.",
+            )
+            page = prepare_blog_comment_page(context, post, raw_url, PlaywrightTimeoutError, report)
+            report("댓글을 최대한 불러오는 중...")
+            load_all_comments(page, report)
+            entries = collect_comment_entries(page)
+            targets, share_marker_index = build_comment_targets(entries)
+            checked_count = sum(1 for target in targets if target["selected"])
+            return TargetDiscoveryResult(
+                targets=targets,
+                total_count=len(targets),
+                checked_count=checked_count,
+                share_marker_index=share_marker_index,
+            )
+        finally:
+            if close_context_when_done and context is not None:
+                context.close()
+
+
+def run_comment_batch_capture(
+    raw_url: str,
+    output_dir: Path,
+    targets: list[dict[str, Any]],
+    progress: Callable[[str], None] | None = None,
+) -> BatchCaptureResult:
+    def report(message: str) -> None:
+        write_log(message)
+        if progress:
+            progress(message)
+
+    selected_targets = [target for target in targets if target.get("selected")]
+    if not selected_targets:
+        raise CommentCaptureError("체크된 댓글 캡처대상이 없습니다.")
+
+    post = parse_blog_post(raw_url)
+    report("댓글 캡처 환경 확인 중...")
+    chrome_exe = ensure_local_environment()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CommentCaptureError(
+            "Playwright가 설치되어 있지 않습니다. run_naver_comment_capture.bat으로 실행하면 자동 설치됩니다."
+        ) from exc
+
+    saved_paths: list[Path] = []
+    failures: list[str] = []
+    context = None
+    browser = None
+    close_context_when_done = False
+    with sync_playwright() as playwright:
+        try:
+            context, close_context_when_done, browser = open_or_connect_chrome_context(
+                playwright=playwright,
+                chrome_exe=chrome_exe,
+                viewport={"width": 390, "height": 844},
+                report=report,
+                launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.",
+            )
+            page = prepare_blog_comment_page(context, post, raw_url, PlaywrightTimeoutError, report)
+            report("댓글 목록을 다시 확인하는 중...")
+            load_all_comments(page, report)
+            rows, _ = build_comment_targets(collect_comment_entries(page), include_entries=True)
+            used_row_ids: set[str] = set()
+            total = len(selected_targets)
+            for index, target in enumerate(selected_targets, start=1):
+                report(f"댓글 캡처 중... ({index}/{total}) {target.get('nickname', '')}")
+                row = find_matching_target_row(target, rows, used_row_ids)
+                if not row:
+                    failures.append(f"{target.get('index')}. {target.get('nickname', '')}: 댓글을 다시 찾지 못했습니다.")
+                    continue
+                used_row_ids.add(row["row_id"])
+                output_path = make_output_path(output_dir, post, row["nickname"] or f"comment_{row['index']}")
+                capture_entry(page, row["entry"], output_path)
+                saved_paths.append(output_path)
+            return BatchCaptureResult(saved_paths=saved_paths, failures=failures)
+        finally:
+            if close_context_when_done and context is not None:
+                context.close()
+
+
+def prepare_blog_comment_page(
+    context: Any,
+    post: BlogPost,
+    raw_url: str,
+    timeout_error_type: type[Exception],
+    report: Callable[[str], None] | None = None,
+) -> Any:
+    page = get_blog_page(context)
+    page.set_default_timeout(10_000)
+    reuse_current_page = current_page_matches_post(page, post, raw_url)
+    if reuse_current_page and report:
+        report("현재 블로그 탭의 글을 그대로 사용합니다.")
+    open_comments(
+        page,
+        post,
+        timeout_error_type,
+        report,
+        reuse_current_page=reuse_current_page,
+    )
+    return page
+
+
+def load_all_comments(
+    page: Any,
+    report: Callable[[str], None] | None = None,
+    max_rounds: int = 35,
+) -> None:
+    previous_count = -1
+    stable_rounds = 0
+    for round_index in range(max_rounds):
+        clicked = try_click_more_comments(page)
+        scroll_comment_frames(page)
+        page.wait_for_timeout(700)
+        current_count = len(collect_comment_entries(page))
+        if report and (round_index == 0 or current_count != previous_count):
+            report(f"댓글을 불러오는 중... 현재 {current_count}개")
+        if current_count <= previous_count and not clicked:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        previous_count = current_count
+        if stable_rounds >= 4:
+            break
+
+
+def try_click_more_comments(page: Any) -> bool:
+    selectors = [
+        ".u_cbox_btn_more",
+        ".u_cbox_more_wrap a",
+        ".u_cbox_more_wrap button",
+        "a:has-text('더보기')",
+        "button:has-text('더보기')",
+        "a:has-text('댓글 더보기')",
+        "button:has-text('댓글 더보기')",
+    ]
+    for frame in page.frames:
+        for selector in selectors:
+            try:
+                locator = frame.locator(selector)
+                count = min(locator.count(), 5)
+            except Exception:
+                continue
+            for index in range(count):
+                item = locator.nth(index)
+                try:
+                    if not item.is_visible(timeout=400):
+                        continue
+                    item.scroll_into_view_if_needed(timeout=1_000)
+                    item.click(timeout=2_000)
+                    page.wait_for_timeout(700)
+                    return True
+                except Exception:
+                    continue
+    return False
+
+
+def scroll_comment_frames(page: Any) -> None:
+    for frame in page.frames:
+        try:
+            frame.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            continue
+    try:
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+    except Exception:
+        pass
+
+
+def build_comment_targets(
+    entries: list[CommentEntry],
+    include_entries: bool = False,
+) -> tuple[list[dict[str, Any]], int | None]:
+    rows: list[dict[str, Any]] = []
+    for original_index, entry in enumerate(entries):
+        comment_text = comment_entry_text(entry)
+        emails = extract_emails(comment_text)
+        preview = compact_text(entry.content or entry.text)
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        parsed_date = parse_comment_datetime(entry.date)
+        row = {
+            "row_id": f"target_{original_index}",
+            "original_index": original_index,
+            "nickname": entry.nickname,
+            "email": emails[0] if emails else "",
+            "emails": emails,
+            "date": entry.date,
+            "preview": preview,
+            "content": entry.content,
+            "text": entry.text,
+            "comment_text": comment_text,
+            "secret": entry.secret,
+            "sort_timestamp": parsed_date.timestamp() if parsed_date else None,
+            "identity": comment_identity(entry),
+            "selected": False,
+        }
+        if include_entries:
+            row["entry"] = entry
+        rows.append(row)
+
+    rows.sort(key=comment_target_sort_key)
+    share_marker_index: int | None = None
+    share_text = normalize_text("공유 완료")
+    for index, row in enumerate(rows):
+        row["index"] = index + 1
+        if share_text in normalize_text(row["comment_text"]):
+            share_marker_index = index
+
+    if share_marker_index is not None:
+        for index, row in enumerate(rows):
+            row["selected"] = index > share_marker_index
+    return rows, (share_marker_index + 1 if share_marker_index is not None else None)
+
+
+def comment_target_sort_key(row: dict[str, Any]) -> tuple[int, float, int]:
+    timestamp = row.get("sort_timestamp")
+    if timestamp is None:
+        return (1, float(row.get("original_index", 0)), int(row.get("original_index", 0)))
+    return (0, float(timestamp), int(row.get("original_index", 0)))
+
+
+def parse_comment_datetime(value: str) -> _dt.datetime | None:
+    text = compact_text(value)
+    now = _dt.datetime.now()
+    if not text:
+        return None
+    if "방금" in text:
+        return now
+    relative_match = re.search(r"(\d+)\s*(분|시간|일)\s*전", text)
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2)
+        if unit == "분":
+            return now - _dt.timedelta(minutes=amount)
+        if unit == "시간":
+            return now - _dt.timedelta(hours=amount)
+        if unit == "일":
+            return now - _dt.timedelta(days=amount)
+    if "어제" in text:
+        time_match = re.search(r"(\d{1,2}):(\d{2})", text)
+        base = now - _dt.timedelta(days=1)
+        if time_match:
+            return base.replace(hour=int(time_match.group(1)), minute=int(time_match.group(2)), second=0, microsecond=0)
+        return base.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    normalized = text.replace("년", ".").replace("월", ".").replace("일", ".")
+    patterns = [
+        (r"(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})\.?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", True),
+        (r"(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})", False),
+        (r"(\d{1,2})[.\-/]\s*(\d{1,2})\.?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", "current_year"),
+    ]
+    for pattern, mode in patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        try:
+            if mode == "current_year":
+                month, day, hour, minute, second = match.groups(default="0")
+                return _dt.datetime(now.year, int(month), int(day), int(hour), int(minute), int(second or 0))
+            year, month, day = match.group(1), match.group(2), match.group(3)
+            if mode is True:
+                hour, minute, second = match.group(4), match.group(5), match.group(6) or "0"
+                return _dt.datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
+            return _dt.datetime(int(year), int(month), int(day))
+        except ValueError:
+            continue
+    return None
+
+
+def comment_entry_text(entry: CommentEntry) -> str:
+    return "\n".join(part for part in [entry.content, entry.text] if part)
+
+
+def comment_identity(entry: CommentEntry) -> str:
+    key = "|".join(
+        [
+            normalize_text(entry.nickname),
+            normalize_text(entry.date),
+            normalize_text(entry.content),
+            normalize_text(entry.text),
+        ]
+    )
+    return key[:500]
+
+
+def target_identity(target: dict[str, Any]) -> str:
+    return "|".join(
+        [
+            normalize_text(str(target.get("nickname", ""))),
+            normalize_text(str(target.get("date", ""))),
+            normalize_text(str(target.get("content", ""))),
+            normalize_text(str(target.get("text", ""))),
+        ]
+    )[:500]
+
+
+def target_matches_row(target: dict[str, Any], row: dict[str, Any]) -> bool:
+    if target_identity(target) == row.get("identity"):
+        return True
+    if normalize_text(str(target.get("nickname", ""))) != normalize_text(str(row.get("nickname", ""))):
+        return False
+    if normalize_text(str(target.get("date", ""))) != normalize_text(str(row.get("date", ""))):
+        return False
+    target_email = normalize_text(str(target.get("email", "")))
+    row_email = normalize_text(str(row.get("email", "")))
+    if target_email and row_email and target_email != row_email:
+        return False
+    return normalize_text(str(target.get("preview", "")))[:80] == normalize_text(str(row.get("preview", "")))[:80]
+
+
+def find_matching_target_row(
+    target: dict[str, Any],
+    rows: list[dict[str, Any]],
+    used_row_ids: set[str],
+) -> dict[str, Any] | None:
+    target_index = int(target.get("index") or 0)
+    if 1 <= target_index <= len(rows):
+        row = rows[target_index - 1]
+        if row["row_id"] not in used_row_ids and target_matches_row(target, row):
+            return row
+
+    for row in rows:
+        if row["row_id"] in used_row_ids:
+            continue
+        if target_matches_row(target, row):
+            return row
+    return None
+
+
 def run_mail_capture(
     email: str,
     output_dir: Path,
@@ -1287,11 +1665,17 @@ class App(tk.Tk):
         self.nickname_var = tk.StringVar()
         self.email_var = tk.StringVar()
         self.output_dir_var = tk.StringVar(value=str(DEFAULT_SAVE_DIR))
-        self.status_var = tk.StringVar(value="링크와 닉네임을 입력한 뒤 캡처를 시작하세요.")
+        self.status_var = tk.StringVar(value="블로그 글 링크를 입력한 뒤 캡처대상 찾기를 누르세요.")
         self.email_status_var = tk.StringVar(value="찾은 이메일: 없음")
 
         self.current_match_mode: str | None = None
         self.current_candidates: list[dict[str, Any]] = []
+        self.current_targets: list[dict[str, Any]] = []
+        self.mail_batch_targets: list[dict[str, Any]] = []
+        self.mail_batch_index = 0
+        self.mail_batch_saved_paths: list[Path] = []
+        self.mail_batch_failures: list[str] = []
+        self.mail_batch_skipped: list[str] = []
         self.last_found_email: str | None = None
         self.last_found_emails: list[str] = []
         self.last_comment_text: str = ""
@@ -1304,31 +1688,33 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=16)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(1, weight=1)
-        outer.rowconfigure(7, weight=1)
+        outer.rowconfigure(5, weight=1)
 
         ttk.Label(outer, text="블로그 글 링크").grid(row=0, column=0, sticky=tk.W, pady=(0, 8))
         ttk.Entry(outer, textvariable=self.url_var).grid(row=0, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
 
-        ttk.Label(outer, text="닉네임").grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.nickname_var).grid(row=1, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
-
-        ttk.Label(outer, text="이메일 (댓글에서 자동 추출 or 직접입력)").grid(row=2, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.email_var).grid(row=2, column=1, columnspan=2, sticky=tk.EW, pady=(0, 8))
-
-        ttk.Label(outer, text="저장 폴더").grid(row=3, column=0, sticky=tk.W, pady=(0, 8))
-        ttk.Entry(outer, textvariable=self.output_dir_var).grid(row=3, column=1, sticky=tk.EW, pady=(0, 8))
-        ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir).grid(row=3, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
+        ttk.Label(outer, text="저장 폴더").grid(row=1, column=0, sticky=tk.W, pady=(0, 8))
+        ttk.Entry(outer, textvariable=self.output_dir_var).grid(row=1, column=1, sticky=tk.EW, pady=(0, 8))
+        ttk.Button(outer, text="폴더 선택", command=self.choose_output_dir).grid(row=1, column=2, sticky=tk.E, padx=(8, 0), pady=(0, 8))
 
         button_bar = ttk.Frame(outer)
-        button_bar.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
-        self.start_button = ttk.Button(button_bar, text="찾고 캡처", command=self.start_find_or_capture)
+        button_bar.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(4, 12))
+        self.start_button = ttk.Button(button_bar, text="캡처대상 찾기", command=self.start_find_or_capture)
         self.start_button.pack(side=tk.LEFT)
+        self.comment_capture_button = ttk.Button(
+            button_bar,
+            text="댓글 캡처",
+            command=self.start_comment_batch_capture,
+            state=tk.DISABLED,
+        )
+        self.comment_capture_button.pack(side=tk.LEFT, padx=(8, 0))
         self.login_button = ttk.Button(button_bar, text="네이버 로그인 열기", command=self.open_login_window)
         self.login_button.pack(side=tk.LEFT, padx=(8, 0))
         self.email_capture_button = ttk.Button(
             button_bar,
             text="이메일 본문 캡처",
-            command=self.start_email_capture,
+            command=self.start_email_batch_capture,
+            state=tk.DISABLED,
         )
         self.email_capture_button.pack(side=tk.LEFT, padx=(8, 0))
         self.open_folder_button = ttk.Button(button_bar, text="저장 폴더 열기", command=self.open_output_dir)
@@ -1338,43 +1724,42 @@ class App(tk.Tk):
         self.progress.pack(side=tk.RIGHT)
 
         ttk.Label(outer, textvariable=self.status_var, foreground="#155724").grid(
-            row=5, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
-        )
-        ttk.Label(outer, textvariable=self.email_status_var, foreground="#0b5394").grid(
-            row=6, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
+            row=3, column=0, columnspan=3, sticky=tk.EW, pady=(0, 8)
         )
 
         self.tree = ttk.Treeview(
             outer,
-            columns=("index", "nickname", "date", "preview", "secret"),
+            columns=("selected", "index", "nickname", "email", "date", "preview"),
             show="headings",
             selectmode="browse",
             height=12,
         )
+        self.tree.heading("selected", text="캡처대상")
         self.tree.heading("index", text="번호")
         self.tree.heading("nickname", text="닉네임")
+        self.tree.heading("email", text="이메일")
         self.tree.heading("date", text="작성 시각")
         self.tree.heading("preview", text="댓글 미리보기")
-        self.tree.heading("secret", text="비밀")
+        self.tree.column("selected", width=80, anchor=tk.CENTER, stretch=False)
         self.tree.column("index", width=55, anchor=tk.CENTER, stretch=False)
         self.tree.column("nickname", width=130, stretch=False)
+        self.tree.column("email", width=190, stretch=False)
         self.tree.column("date", width=150, stretch=False)
-        self.tree.column("preview", width=360, stretch=True)
-        self.tree.column("secret", width=60, anchor=tk.CENTER, stretch=False)
-        self.tree.grid(row=7, column=0, columnspan=3, sticky=tk.NSEW)
-        self.tree.bind("<Double-1>", self.capture_selected_candidate)
-        self.tree.bind("<Return>", self.capture_selected_candidate)
+        self.tree.column("preview", width=320, stretch=True)
+        self.tree.grid(row=5, column=0, columnspan=3, sticky=tk.NSEW)
+        self.tree.bind("<Button-1>", self.on_target_tree_click)
+        self.tree.bind("<space>", self.on_target_tree_space)
 
         scroll = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
-        scroll.grid(row=7, column=3, sticky=tk.NS)
+        scroll.grid(row=5, column=3, sticky=tk.NS)
 
         note = (
             "앱 전용 Chrome 프로필을 사용합니다. 첫 사용이면 '네이버 로그인 열기'로 로그인한 뒤 "
             "그 Chrome 창을 그대로 둔 채 캡처를 시작하세요. 비밀댓글은 로그인 계정에서 보이는 경우에만 캡처됩니다."
         )
         ttk.Label(outer, text=note, foreground="#555555", wraplength=720).grid(
-            row=8, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
+            row=6, column=0, columnspan=3, sticky=tk.EW, pady=(12, 0)
         )
 
     def choose_output_dir(self) -> None:
@@ -1394,53 +1779,25 @@ class App(tk.Tk):
             messagebox.showinfo(
                 APP_TITLE,
                 "네이버 로그인 창을 열었습니다.\n\n"
-                "로그인을 마친 뒤 이 Chrome 창을 그대로 둔 채 '찾고 캡처'를 눌러 주세요.\n"
+                "로그인을 마친 뒤 이 Chrome 창을 그대로 둔 채 '캡처대상 찾기'를 눌러 주세요.\n"
                 "이미 닫았다면 저장된 로그인 세션으로 새 캡처 창을 엽니다.",
             )
         except Exception as exc:
             messagebox.showerror(APP_TITLE, str(exc))
 
     def start_find_or_capture(self) -> None:
-        self.clear_candidates()
-        self.clear_email_state()
-        self.current_match_mode = None
-        self.start_worker(selected_index=None, forced_match_mode=None)
-
-    def capture_selected_candidate(self, event: tk.Event | None = None) -> None:
-        if self.is_busy:
-            return
-        if not self.current_candidates:
-            return
-        selected_items = self.tree.selection()
-        if not selected_items:
-            messagebox.showinfo(APP_TITLE, "캡처할 댓글 후보를 선택해 주세요.")
-            return
-        item = selected_items[0]
-        selected_index = int(self.tree.set(item, "index")) - 1
-        self.start_worker(selected_index=selected_index, forced_match_mode=self.current_match_mode)
-
-    def start_worker(self, selected_index: int | None, forced_match_mode: str | None) -> None:
+        self.clear_targets()
         raw_url = self.url_var.get()
-        nickname = self.nickname_var.get()
-        output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
-
         self.set_busy(True)
-        self.status_var.set("Chrome을 열고 댓글을 찾는 중입니다...")
+        self.status_var.set("Chrome을 열고 캡처대상을 찾는 중입니다...")
 
         def progress(message: str) -> None:
             self.after(0, lambda: self.status_var.set(message))
 
         def worker() -> None:
             try:
-                result = run_capture(
-                    raw_url=raw_url,
-                    nickname=nickname,
-                    output_dir=output_dir,
-                    selected_index=selected_index,
-                    forced_match_mode=forced_match_mode,
-                    progress=progress,
-                )
-                self.after(0, lambda: self.handle_result(result))
+                result = run_discover_targets(raw_url=raw_url, progress=progress)
+                self.after(0, lambda: self.handle_discovery_result(result))
             except Exception as exc:
                 details = str(exc)
                 if not isinstance(exc, CommentCaptureError):
@@ -1449,18 +1806,68 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_email_capture(self, selected_mail_id: str | None = None) -> None:
-        emails = extract_emails(self.email_var.get())
-        if not emails:
-            messagebox.showinfo(APP_TITLE, "이메일 칸에 이메일 주소를 입력해 주세요.")
+    def start_comment_batch_capture(self) -> None:
+        selected_targets = self.checked_targets()
+        if not selected_targets:
+            messagebox.showinfo(APP_TITLE, "체크된 댓글 캡처대상이 없습니다.")
             return
 
-        email = emails[0]
-        if self.email_var.get().strip() != email:
-            self.email_var.set(email)
+        raw_url = self.url_var.get()
         output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
         self.set_busy(True)
-        self.status_var.set("네이버 메일에서 이메일을 찾는 중입니다...")
+        self.status_var.set("체크된 댓글을 캡처하는 중입니다...")
+
+        def progress(message: str) -> None:
+            self.after(0, lambda: self.status_var.set(message))
+
+        def worker() -> None:
+            try:
+                result = run_comment_batch_capture(
+                    raw_url=raw_url,
+                    output_dir=output_dir,
+                    targets=selected_targets,
+                    progress=progress,
+                )
+                self.after(0, lambda: self.handle_comment_batch_result(result))
+            except Exception as exc:
+                details = str(exc)
+                if not isinstance(exc, CommentCaptureError):
+                    details = f"{details}\n\n{traceback.format_exc()}"
+                self.after(0, lambda: self.handle_error(details))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def start_email_batch_capture(self) -> None:
+        selected_targets = self.checked_targets()
+        if not selected_targets:
+            messagebox.showinfo(APP_TITLE, "체크된 이메일 캡처대상이 없습니다.")
+            return
+
+        self.mail_batch_targets = selected_targets
+        self.mail_batch_index = 0
+        self.mail_batch_saved_paths = []
+        self.mail_batch_failures = []
+        self.mail_batch_skipped = []
+        self.set_busy(True)
+        self.process_next_mail_target()
+
+    def process_next_mail_target(self, selected_mail_id: str | None = None) -> None:
+        while self.mail_batch_index < len(self.mail_batch_targets):
+            target = self.mail_batch_targets[self.mail_batch_index]
+            email = compact_text(str(target.get("email", "")))
+            if email:
+                break
+            self.mail_batch_skipped.append(f"{target.get('index')}. {target.get('nickname', '')}: 이메일 없음")
+            self.mail_batch_index += 1
+
+        if self.mail_batch_index >= len(self.mail_batch_targets):
+            self.finish_mail_batch()
+            return
+
+        target = self.mail_batch_targets[self.mail_batch_index]
+        email = compact_text(str(target.get("email", "")))
+        output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
+        self.status_var.set(f"네이버 메일에서 {email} 검색 중... ({self.mail_batch_index + 1}/{len(self.mail_batch_targets)})")
 
         def progress(message: str) -> None:
             self.after(0, lambda: self.status_var.set(message))
@@ -1473,14 +1880,97 @@ class App(tk.Tk):
                     selected_mail_id=selected_mail_id,
                     progress=progress,
                 )
-                self.after(0, lambda: self.handle_mail_result(result))
+                self.after(0, lambda: self.handle_batch_mail_result(result))
             except Exception as exc:
                 details = str(exc)
                 if not isinstance(exc, CommentCaptureError):
                     details = f"{details}\n\n{traceback.format_exc()}"
-                self.after(0, lambda: self.handle_error(details))
+                self.after(0, lambda: self.handle_batch_mail_error(email, details))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def handle_discovery_result(self, result: TargetDiscoveryResult) -> None:
+        self.current_targets = result.targets
+        self.populate_targets(result.targets)
+        self.set_busy(False)
+        if result.share_marker_index is None:
+            self.status_var.set(f"댓글 {result.total_count}개를 찾았습니다. '공유 완료' 댓글이 없어 자동 체크하지 않았습니다.")
+        else:
+            self.status_var.set(
+                f"댓글 {result.total_count}개를 찾았습니다. 마지막 '공유 완료'는 {result.share_marker_index}번, "
+                f"자동 체크 {result.checked_count}개입니다."
+            )
+
+    def handle_comment_batch_result(self, result: BatchCaptureResult) -> None:
+        self.set_busy(False)
+        saved_count = len(result.saved_paths)
+        failure_count = len(result.failures)
+        self.status_var.set(f"댓글 캡처 완료: 저장 {saved_count}개, 실패 {failure_count}개")
+        message = self.batch_result_message("댓글 캡처", result)
+        messagebox.showinfo(APP_TITLE, message)
+
+    def handle_batch_mail_result(self, result: MailCaptureResult) -> None:
+        if result.status == "captured" and result.saved_path:
+            self.mail_batch_saved_paths.append(result.saved_path)
+            self.mail_batch_index += 1
+            self.process_next_mail_target()
+            return
+
+        if result.status == "multiple" and result.candidates:
+            self.status_var.set(f"{result.email} 검색 결과 {len(result.candidates)}개를 찾았습니다. 메일을 선택하세요.")
+            self.show_mail_choice_dialog(
+                result.email,
+                result.candidates,
+                on_select=lambda mail_id: self.process_next_mail_target(selected_mail_id=mail_id),
+                on_cancel=lambda: self.handle_batch_mail_error(result.email, "메일 선택을 취소했습니다."),
+            )
+            return
+
+        self.handle_batch_mail_error(result.email, "메일 캡처를 완료했지만 저장된 파일이 없습니다.")
+
+    def handle_batch_mail_error(self, email: str, details: str) -> None:
+        self.mail_batch_failures.append(f"{email}: {details}")
+        self.mail_batch_index += 1
+        self.process_next_mail_target()
+
+    def finish_mail_batch(self) -> None:
+        self.set_busy(False)
+        result = BatchCaptureResult(
+            saved_paths=self.mail_batch_saved_paths,
+            failures=self.mail_batch_failures,
+            skipped=self.mail_batch_skipped,
+        )
+        saved_count = len(result.saved_paths)
+        failure_count = len(result.failures)
+        skipped_count = len(result.skipped or [])
+        self.status_var.set(f"메일 본문 캡처 완료: 저장 {saved_count}개, 실패 {failure_count}개, 건너뜀 {skipped_count}개")
+        messagebox.showinfo(APP_TITLE, self.batch_result_message("메일 본문 캡처", result))
+
+    def batch_result_message(self, title: str, result: BatchCaptureResult) -> str:
+        lines = [
+            f"{title} 결과",
+            "",
+            f"저장: {len(result.saved_paths)}개",
+            f"실패: {len(result.failures)}개",
+        ]
+        if result.skipped is not None:
+            lines.append(f"건너뜀: {len(result.skipped)}개")
+        if result.saved_paths:
+            lines.extend(["", "저장 파일:"])
+            lines.extend(str(path) for path in result.saved_paths[:10])
+            if len(result.saved_paths) > 10:
+                lines.append(f"...외 {len(result.saved_paths) - 10}개")
+        if result.failures:
+            lines.extend(["", "실패:"])
+            lines.extend(result.failures[:10])
+            if len(result.failures) > 10:
+                lines.append(f"...외 {len(result.failures) - 10}개")
+        if result.skipped:
+            lines.extend(["", "건너뜀:"])
+            lines.extend(result.skipped[:10])
+            if len(result.skipped) > 10:
+                lines.append(f"...외 {len(result.skipped) - 10}개")
+        return "\n".join(lines)
 
     def handle_result(self, result: CaptureResult) -> None:
         self.set_busy(False)
@@ -1535,18 +2025,86 @@ class App(tk.Tk):
         state = tk.DISABLED if busy else tk.NORMAL
         self.start_button.configure(state=state)
         self.login_button.configure(state=state)
-        self.email_capture_button.configure(state=tk.DISABLED if busy else tk.NORMAL)
         self.open_folder_button.configure(state=state)
         if busy:
+            self.comment_capture_button.configure(state=tk.DISABLED)
+            self.email_capture_button.configure(state=tk.DISABLED)
             self.progress.start(12)
         else:
             self.progress.stop()
-            self.email_capture_button.configure(state=tk.NORMAL)
+            target_state = tk.NORMAL if self.current_targets else tk.DISABLED
+            self.comment_capture_button.configure(state=target_state)
+            self.email_capture_button.configure(state=target_state)
 
     def clear_candidates(self) -> None:
         self.current_candidates = []
         for item in self.tree.get_children():
             self.tree.delete(item)
+
+    def clear_targets(self) -> None:
+        self.current_targets = []
+        self.mail_batch_targets = []
+        self.mail_batch_index = 0
+        self.mail_batch_saved_paths = []
+        self.mail_batch_failures = []
+        self.mail_batch_skipped = []
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.comment_capture_button.configure(state=tk.DISABLED)
+        self.email_capture_button.configure(state=tk.DISABLED)
+
+    def checked_targets(self) -> list[dict[str, Any]]:
+        return [target.copy() for target in self.current_targets if target.get("selected")]
+
+    def target_by_iid(self, iid: str) -> dict[str, Any] | None:
+        for target in self.current_targets:
+            if str(target.get("row_id")) == str(iid):
+                return target
+        return None
+
+    def on_target_tree_click(self, event: tk.Event) -> None:
+        if self.is_busy:
+            return
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.tree.identify_column(event.x) != "#1":
+            return
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.toggle_target(iid)
+
+    def on_target_tree_space(self, event: tk.Event) -> str | None:
+        if self.is_busy:
+            return "break"
+        selected = self.tree.selection()
+        if selected:
+            self.toggle_target(selected[0])
+        return "break"
+
+    def toggle_target(self, iid: str) -> None:
+        target = self.target_by_iid(iid)
+        if not target:
+            return
+        target["selected"] = not bool(target.get("selected"))
+        self.refresh_target_row(target)
+        checked_count = len([item for item in self.current_targets if item.get("selected")])
+        self.status_var.set(f"캡처대상 {checked_count}개 선택됨")
+
+    def refresh_target_row(self, target: dict[str, Any]) -> None:
+        iid = str(target["row_id"])
+        if not self.tree.exists(iid):
+            return
+        self.tree.item(
+            iid,
+            values=(
+                "☑" if target.get("selected") else "☐",
+                target.get("index", ""),
+                target.get("nickname", ""),
+                target.get("email", ""),
+                target.get("date", ""),
+                target.get("preview", ""),
+            ),
+        )
 
     def clear_email_state(self) -> None:
         self.last_found_email = None
@@ -1570,7 +2128,13 @@ class App(tk.Tk):
         else:
             self.email_status_var.set("찾은 이메일: 없음")
 
-    def show_mail_choice_dialog(self, email: str, candidates: list[dict[str, Any]]) -> None:
+    def show_mail_choice_dialog(
+        self,
+        email: str,
+        candidates: list[dict[str, Any]],
+        on_select: Callable[[str], None] | None = None,
+        on_cancel: Callable[[], None] | None = None,
+    ) -> None:
         dialog = tk.Toplevel(self)
         dialog.title("메일 선택")
         dialog.geometry("820x420")
@@ -1638,10 +2202,40 @@ class App(tk.Tk):
                 return
             mail_id = tree.set(selected[0], "mail_id")
             dialog.destroy()
-            self.start_email_capture(selected_mail_id=mail_id)
+            if on_select:
+                on_select(mail_id)
 
+        def cancel() -> None:
+            dialog.destroy()
+            if on_cancel:
+                on_cancel()
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
         ttk.Button(button_bar, text="선택 메일 캡처", command=capture_selected).pack(side=tk.LEFT)
-        ttk.Button(button_bar, text="취소", command=dialog.destroy).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(button_bar, text="취소", command=cancel).pack(side=tk.LEFT, padx=(8, 0))
+
+    def populate_targets(self, targets: list[dict[str, Any]]) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for target in targets:
+            iid = str(target["row_id"])
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(
+                    "☑" if target.get("selected") else "☐",
+                    target.get("index", ""),
+                    target.get("nickname", ""),
+                    target.get("email", ""),
+                    target.get("date", ""),
+                    target.get("preview", ""),
+                ),
+            )
+        first = self.tree.get_children()
+        if first:
+            self.tree.selection_set(first[0])
+            self.tree.focus(first[0])
 
     def populate_candidates(self, candidates: list[dict[str, Any]]) -> None:
         self.clear_candidates()
