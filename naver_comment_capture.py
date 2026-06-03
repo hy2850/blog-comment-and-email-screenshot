@@ -166,6 +166,13 @@ def sanitize_filename(value: str) -> str:
     return value[:80] or "nickname"
 
 
+def target_id_from_email(email: str) -> str:
+    email = compact_text(email)
+    if "@" in email:
+        return email.split("@", 1)[0]
+    return email or "target"
+
+
 def extract_emails(value: str) -> list[str]:
     emails: list[str] = []
     seen: set[str] = set()
@@ -585,10 +592,11 @@ def run_capture(
                 raise CommentCaptureError("선택한 댓글 번호가 현재 후보 목록 범위를 벗어났습니다. 다시 검색해 주세요.")
 
             entry = entries[target_index]
-            output_path = make_output_path(output_dir, post, nickname)
-            capture_entry(page, entry, output_path)
             comment_text = "\n".join(part for part in [entry.content, entry.text] if part)
             emails = extract_emails(comment_text)
+            target_id = target_id_from_email(emails[0]) if emails else nickname
+            output_path = make_output_path(output_dir, post, target_id)
+            capture_entry(page, entry, output_path)
             return CaptureResult(
                 status="captured",
                 saved_path=output_path,
@@ -850,15 +858,24 @@ def build_not_found_message(nickname: str, visible_nicknames: list[str]) -> str:
     )
 
 
-def make_output_path(output_dir: Path, post: BlogPost, nickname: str) -> Path:
-    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{sanitize_filename(post.blog_id)}_{post.log_no}_{sanitize_filename(nickname)}_{timestamp}.png"
-    path = output_dir / filename
+def make_capture_output_path(output_dir: Path, blog_article_id: str, target_id: str, capture_kind: str) -> Path:
+    base_stem = "_".join(
+        [
+            sanitize_filename(blog_article_id),
+            sanitize_filename(target_id),
+            sanitize_filename(capture_kind),
+        ]
+    )
+    path = output_dir / f"{base_stem}.png"
     counter = 2
     while path.exists():
-        path = output_dir / f"{path.stem}_{counter}{path.suffix}"
+        path = output_dir / f"{base_stem}_{counter}.png"
         counter += 1
     return path
+
+
+def make_output_path(output_dir: Path, post: BlogPost, target_id: str) -> Path:
+    return make_capture_output_path(output_dir, post.log_no, target_id, "comment")
 
 
 def capture_entry(page: Any, entry: CommentEntry, output_path: Path) -> None:
@@ -904,7 +921,7 @@ def run_discover_targets(
             report("댓글을 최대한 불러오는 중...")
             load_all_comments(page, report)
             entries = collect_comment_entries(page)
-            targets, share_marker_index = build_comment_targets(entries)
+            targets, share_marker_index = build_comment_targets(entries, blog_article_id=post.log_no)
             checked_count = sum(1 for target in targets if target["selected"])
             return TargetDiscoveryResult(
                 targets=targets,
@@ -962,7 +979,11 @@ def run_comment_batch_capture(
             page = prepare_blog_comment_page(context, post, raw_url, PlaywrightTimeoutError, report)
             report("댓글 목록을 다시 확인하는 중...")
             load_all_comments(page, report)
-            rows, _ = build_comment_targets(collect_comment_entries(page), include_entries=True)
+            rows, _ = build_comment_targets(
+                collect_comment_entries(page),
+                include_entries=True,
+                blog_article_id=post.log_no,
+            )
             used_row_ids: set[str] = set()
             total = len(selected_targets)
             for index, target in enumerate(selected_targets, start=1):
@@ -972,7 +993,8 @@ def run_comment_batch_capture(
                     failures.append(f"{target.get('index')}. {target.get('nickname', '')}: 댓글을 다시 찾지 못했습니다.")
                     continue
                 used_row_ids.add(row["row_id"])
-                output_path = make_output_path(output_dir, post, row["nickname"] or f"comment_{row['index']}")
+                target_id = target_id_from_email(str(row.get("email", "")))
+                output_path = make_output_path(output_dir, post, target_id)
                 capture_entry(page, row["entry"], output_path)
                 saved_paths.append(output_path)
             return BatchCaptureResult(saved_paths=saved_paths, failures=failures)
@@ -1072,6 +1094,7 @@ def scroll_comment_frames(page: Any) -> None:
 def build_comment_targets(
     entries: list[CommentEntry],
     include_entries: bool = False,
+    blog_article_id: str = "",
 ) -> tuple[list[dict[str, Any]], int | None]:
     rows: list[dict[str, Any]] = []
     for original_index, entry in enumerate(entries):
@@ -1084,6 +1107,7 @@ def build_comment_targets(
         row = {
             "row_id": f"target_{original_index}",
             "original_index": original_index,
+            "blog_article_id": blog_article_id,
             "nickname": entry.nickname,
             "email": emails[0] if emails else "",
             "emails": emails,
@@ -1238,6 +1262,7 @@ def run_mail_capture(
     email: str,
     output_dir: Path,
     selected_mail_id: str | None = None,
+    blog_article_id: str = "",
     preferred_subject_keyword: str = "",
     progress: Callable[[str], None] | None = None,
 ) -> MailCaptureResult:
@@ -1247,6 +1272,7 @@ def run_mail_capture(
             progress(message)
 
     email = compact_text(email)
+    blog_article_id = compact_text(blog_article_id) or "unknown_article"
     if not email:
         raise CommentCaptureError("먼저 댓글에서 이메일을 찾아야 합니다.")
 
@@ -1310,7 +1336,7 @@ def run_mail_capture(
             goto_page(page, read_url, PlaywrightTimeoutError)
             ensure_mail_accessible(page)
             report("메일 본문을 캡처하는 중...")
-            output_path = make_mail_output_path(output_dir, email, mail_id)
+            output_path = make_mail_output_path(output_dir, blog_article_id, email)
             capture_mail_body(page, output_path)
             return MailCaptureResult(status="captured", email=email, saved_path=output_path, mail_id=mail_id)
         finally:
@@ -1490,15 +1516,8 @@ def collect_mail_entries(page: Any) -> list[dict[str, Any]]:
     return [entry for entry in normalized if entry["mail_id"]]
 
 
-def make_mail_output_path(output_dir: Path, email: str, mail_id: str) -> Path:
-    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"mail_{sanitize_filename(email)}_{sanitize_filename(mail_id)}_{timestamp}.png"
-    path = output_dir / filename
-    counter = 2
-    while path.exists():
-        path = output_dir / f"{path.stem}_{counter}{path.suffix}"
-        counter += 1
-    return path
+def make_mail_output_path(output_dir: Path, blog_article_id: str, email: str) -> Path:
+    return make_capture_output_path(output_dir, blog_article_id, target_id_from_email(email), "mail")
 
 
 def capture_mail_body(page: Any, output_path: Path) -> None:
@@ -1903,6 +1922,12 @@ class App(tk.Tk):
 
         target = self.mail_batch_targets[self.mail_batch_index]
         email = compact_text(str(target.get("email", "")))
+        blog_article_id = compact_text(str(target.get("blog_article_id", "")))
+        if not blog_article_id:
+            try:
+                blog_article_id = parse_blog_post(self.url_var.get()).log_no
+            except Exception:
+                blog_article_id = "unknown_article"
         output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
         self.status_var.set(f"네이버 메일에서 {email} 검색 중... ({self.mail_batch_index + 1}/{len(self.mail_batch_targets)})")
 
@@ -1915,6 +1940,7 @@ class App(tk.Tk):
                     email=email,
                     output_dir=output_dir,
                     selected_mail_id=selected_mail_id,
+                    blog_article_id=blog_article_id,
                     preferred_subject_keyword=self.mail_batch_subject_keyword,
                     progress=progress,
                 )
