@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,21 @@ COMMENT_READY_SELECTORS = [
     ".commentbox_header",
     *COMMENT_CONTAINER_SELECTORS,
 ]
+POINT_REQUEST_URL = "https://point.directwed.co.kr/point/pointrequest"
+POINT_REMARK_URLS = {
+    "224249960139": "https://docs.google.com/spreadsheets/d/1_VuJyqneyLB7H8easxbmFZ1rCuZe1FnkXqznDru3dNE/edit?usp=sharing",
+    "224274558663": "https://docs.google.com/spreadsheets/d/1cBm3us7MkvBi5qf6H6OSU92Q-1EJbDyO/edit?usp=sharing&ouid=100290969452498788275&rtpof=true&sd=true",
+    "224292770619": "https://docs.google.com/spreadsheets/d/1lL_yWFOGVNgwVlZVvs3OYhOFPInuDF1T/edit?usp=sharing&ouid=100290969452498788275&rtpof=true&sd=true",
+    "224286946614": "",
+    "224296086311": "",
+    "224296188790": "",
+}
+POINT_COMPLETION_PHRASES = (
+    "완료",
+    "신청되었습니다",
+    "등록되었습니다",
+    "저장되었습니다",
+)
 
 
 class CommentCaptureError(Exception):
@@ -133,6 +149,13 @@ class BatchCaptureResult:
     saved_paths: list[Path]
     failures: list[str]
     skipped: list[str] | None = None
+
+
+@dataclass
+class PointRequestBatchResult:
+    completed: list[str]
+    failures: list[str]
+    skipped: list[str]
 
 
 def compact_text(value: str) -> str:
@@ -1413,6 +1436,641 @@ def run_mail_capture(
                 context.close()
 
 
+def run_point_request_batch(
+    raw_url: str,
+    output_dir: Path,
+    targets: list[dict[str, Any]],
+    progress: Callable[[str], None] | None = None,
+    wait_for_user_continue: Callable[[dict[str, Any], int, int], bool] | None = None,
+) -> PointRequestBatchResult:
+    def report(message: str) -> None:
+        write_log(message)
+        if progress:
+            progress(message)
+
+    selected_targets = [target for target in targets if target.get("selected")]
+    if not selected_targets:
+        raise CommentCaptureError("체크된 포인트 신청 대상이 없습니다.")
+
+    fallback_post = parse_blog_post(raw_url)
+    report("포인트 신청 환경 확인 중...")
+    chrome_exe = ensure_local_environment()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CommentCaptureError(
+            "Playwright가 설치되어 있지 않습니다. run_naver_comment_capture.bat으로 실행하면 자동 설치됩니다."
+        ) from exc
+
+    completed: list[str] = []
+    failures: list[str] = []
+    skipped: list[str] = []
+    context = None
+    browser = None
+    close_context_when_done = False
+    with sync_playwright() as playwright:
+        try:
+            context, close_context_when_done, browser = open_or_connect_chrome_context(
+                playwright=playwright,
+                chrome_exe=chrome_exe,
+                viewport={"width": 1200, "height": 900},
+                report=report,
+                launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.",
+            )
+            page = get_point_page(context)
+            page.set_default_timeout(12_000)
+            dialog_messages: list[str] = []
+
+            def on_dialog(dialog: Any) -> None:
+                try:
+                    dialog_messages.append(compact_text(dialog.message))
+                    dialog.accept()
+                except Exception:
+                    pass
+
+            try:
+                page.on("dialog", on_dialog)
+            except Exception:
+                pass
+
+            total = len(selected_targets)
+            for index, target in enumerate(selected_targets, start=1):
+                label = point_target_label(target)
+                try:
+                    payload = build_point_request_payload(target, output_dir, fallback_post)
+                except Exception as exc:
+                    failures.append(f"{label}: {exc}")
+                    continue
+
+                dialog_messages.clear()
+                try:
+                    report(f"포인트 신청 폼 입력 중... ({index}/{total}) {payload['target_id']}")
+                    fill_point_request_form(page, payload, PlaywrightTimeoutError)
+                    report(
+                        f"포인트 신청 폼 입력 완료: {payload['target_id']} "
+                        "사이트에서 내용을 확인하고 '신청' 버튼을 누른 뒤 앱에서 '계속'을 눌러 주세요."
+                    )
+                    if wait_for_user_continue and not wait_for_user_continue(payload, index, total):
+                        skipped.append(f"{label}: 사용자가 포인트 신청 진행을 중단했습니다.")
+                        report("포인트 신청 진행을 중단했습니다.")
+                        break
+                    completed.append(f"{payload['blog_article_id']}_{payload['target_id']}")
+                    report(f"포인트 신청 사용자 확인: {payload['target_id']} ({index}/{total})")
+                except Exception as exc:
+                    failures.append(f"{label}: {exc}")
+            return PointRequestBatchResult(completed=completed, failures=failures, skipped=skipped)
+        finally:
+            if close_context_when_done and context is not None:
+                context.close()
+
+
+def build_point_request_payload(target: dict[str, Any], output_dir: Path, fallback_post: BlogPost) -> dict[str, Any]:
+    email = compact_text(str(target.get("email", "")))
+    if not email:
+        raise CommentCaptureError("이메일이 없어 target_id를 만들 수 없습니다.")
+    target_id = target_id_from_email(email)
+    blog_article_id = compact_text(str(target.get("blog_article_id", ""))) or fallback_post.log_no
+    comment_file = find_existing_capture_file(output_dir, blog_article_id, target_id, "comment")
+    mail_file = find_existing_capture_file(output_dir, blog_article_id, target_id, "mail")
+    if not comment_file:
+        raise CommentCaptureError(f"댓글 캡처 파일을 찾지 못했습니다: {blog_article_id}_{target_id}_comment.png")
+    if not mail_file:
+        raise CommentCaptureError(f"메일 캡처 파일을 찾지 못했습니다: {blog_article_id}_{target_id}_mail.png")
+    return {
+        "blog_article_id": blog_article_id,
+        "target_id": target_id,
+        "remark": POINT_REMARK_URLS.get(blog_article_id, ""),
+        "comment_file": comment_file,
+        "mail_file": mail_file,
+    }
+
+
+def point_target_label(target: dict[str, Any]) -> str:
+    index = compact_text(str(target.get("index", "")))
+    email = compact_text(str(target.get("email", "")))
+    target_id = target_id_from_email(email) if email else compact_text(str(target.get("nickname", "")))
+    if index:
+        return f"{index}. {target_id}"
+    return target_id or "대상"
+
+
+def fill_point_request_form(page: Any, payload: dict[str, Any], timeout_error_type: type[Exception]) -> None:
+    goto_page(page, POINT_REQUEST_URL, timeout_error_type)
+    ensure_point_accessible(page)
+    wait_for_point_form(page, timeout_error_type)
+    scroll_to_point_request_section(page)
+    select_point_option(page, "신청 구분", "적립 신청")
+    page.wait_for_timeout(500)
+    select_point_option(page, "포인트 구분", "블로그 정보공유")
+    set_point_url_fields(page, payload["blog_article_id"])
+    set_point_share_id_field(page, payload["target_id"])
+    set_point_text_field(page, "비고", payload["remark"])
+    check_point_checkbox(page, "동의함", fallback_label="주의 사항")
+    check_point_radio(page, "홍보문구작성 여부", "예")
+    set_point_file_input(page, "파일 첨부 1", Path(payload["comment_file"]), fallback_index=0)
+    set_point_file_input(page, "파일 첨부 2", Path(payload["mail_file"]), fallback_index=1)
+
+
+def ensure_point_accessible(page: Any) -> None:
+    url = (page.url or "").casefold()
+    if "login" in url:
+        raise CommentCaptureError("포인트 사이트 로그인 필요: 로그인 후 다시 시도해 주세요.")
+    try:
+        body_text = compact_text(page.locator("body").inner_text(timeout=2_000))
+    except Exception:
+        body_text = ""
+    if "로그인 후 사용" in body_text or "로그인" in body_text and "포인트 신청" not in body_text:
+        raise CommentCaptureError("포인트 사이트 로그인 필요: 로그인 후 다시 시도해 주세요.")
+
+
+def wait_for_point_form(page: Any, timeout_error_type: type[Exception], timeout_ms: int = 20_000) -> None:
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        ensure_point_accessible(page)
+        try:
+            has_form = page.evaluate(
+                """
+                () => {
+                  const text = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ');
+                  return text.includes('포인트 신청') && text.includes('신청 구분');
+                }
+                """
+            )
+        except Exception:
+            has_form = False
+        if has_form:
+            return
+        try:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+    raise CommentCaptureError("포인트 신청 폼을 찾지 못했습니다. 포인트 사이트 로그인 상태를 확인해 주세요.")
+
+
+def scroll_to_point_request_section(page: Any) -> None:
+    try:
+        page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('section, article, form, div, h1, h2, h3, h4'));
+              const node = nodes.find((el) => (el.innerText || el.textContent || '').includes('포인트 신청'));
+              if (node) node.scrollIntoView({ block: 'center', inline: 'nearest' });
+              else window.scrollTo(0, document.body.scrollHeight);
+            }
+            """
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(400)
+
+
+def select_point_option(page: Any, label: str, option_text: str) -> None:
+    for _ in range(12):
+        if set_native_select_by_label(page, label, option_text):
+            return
+        if click_custom_select_by_label(page, label, option_text):
+            return
+        page.wait_for_timeout(400)
+    raise CommentCaptureError(f"'{label}' 드롭다운에서 '{option_text}' 옵션을 선택하지 못했습니다.")
+
+
+def set_native_select_by_label(page: Any, label: str, option_text: str) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                point_form_script(
+                    """
+                  const { label, optionText } = args;
+                  const controls = controlsNearLabel(label, 'select');
+                  for (const select of controls) {
+                    const option = Array.from(select.options || []).find((item) => clean(item.textContent).includes(optionText));
+                    if (option) {
+                      select.value = option.value;
+                      dispatchChange(select);
+                      return true;
+                    }
+                  }
+                  return false;
+                    """
+                ),
+                {"label": label, "optionText": option_text},
+            )
+        )
+    except Exception:
+        return False
+
+
+def click_custom_select_by_label(page: Any, label: str, option_text: str) -> bool:
+    try:
+        opened = bool(
+            page.evaluate(
+                point_form_script(
+                    """
+                  const { label } = args;
+                  const controls = controlsNearLabel(label, 'button, [role="combobox"], input[readonly], .select, .dropdown, [class*="select"], [class*="dropdown"]');
+                  for (const control of controls) {
+                    if (control.tagName && control.tagName.toLowerCase() === 'select') continue;
+                    if (!visible(control)) continue;
+                    control.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    control.click();
+                    return true;
+                  }
+                  return false;
+                    """
+                ),
+                {"label": label},
+            )
+        )
+    except Exception:
+        opened = False
+    if not opened:
+        return False
+    page.wait_for_timeout(500)
+    try:
+        return bool(
+            page.evaluate(
+                point_form_script(
+                    """
+                  const { optionText } = args;
+                  const nodes = Array.from(document.querySelectorAll('li, a, button, div, span, [role="option"]'));
+                  for (const node of nodes) {
+                    if (!visible(node)) continue;
+                    const text = clean(node.innerText || node.textContent);
+                    if (text === optionText || text.includes(optionText)) {
+                      node.scrollIntoView({ block: 'center', inline: 'nearest' });
+                      node.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                    """
+                ),
+                {"optionText": option_text},
+            )
+        )
+    except Exception:
+        return False
+
+
+def set_point_url_fields(page: Any, blog_article_id: str) -> None:
+    for _ in range(15):
+        ok = page.evaluate(
+            point_form_script(
+                """
+              const { blogArticleId } = args;
+              const fields = findUrlFields();
+              if (!fields || fields.inputs.length < 2) return false;
+              setValue(fields.inputs[0], 'shuchel');
+              setValue(fields.inputs[1], blogArticleId);
+              if (fields.select) selectOptionByTextOrValue(fields.select, '1');
+              return true;
+                """
+            ),
+            {"blogArticleId": blog_article_id},
+        )
+        if ok:
+            return
+        page.wait_for_timeout(400)
+    raise CommentCaptureError("URL 입력칸을 찾지 못했습니다. 포인트 구분 선택 후 URL 입력 영역이 보이는지 확인해 주세요.")
+
+
+def set_point_share_id_field(page: Any, target_id: str) -> None:
+    labels = ("공유 아이디", "공유아이디", "공유 ID", "공유ID")
+    for _ in range(10):
+        for label in labels:
+            if try_set_point_text_field(page, label, target_id):
+                return
+        page.wait_for_timeout(300)
+    raise CommentCaptureError("'공유 아이디' 입력칸을 찾지 못했습니다.")
+
+
+def set_point_text_field(page: Any, label: str, value: str) -> None:
+    if not try_set_point_text_field(page, label, value):
+        raise CommentCaptureError(f"'{label}' 입력칸을 찾지 못했습니다.")
+
+
+def try_set_point_text_field(page: Any, label: str, value: str) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                point_form_script(
+                    """
+                  const { label, value } = args;
+          const controls = controlsNearLabel(label, `${textInputSelector}, textarea`)
+            .filter((control) => !control.disabled && !control.readOnly);
+          if (!controls.length) return false;
+          const emptyControl = controls.find((control) => clean(control.value) === '');
+          setValue(emptyControl || controls[0], value || '');
+          return true;
+                    """
+                ),
+                {"label": label, "value": value},
+            )
+        )
+    except Exception:
+        return False
+
+
+def check_point_checkbox(page: Any, label: str, fallback_label: str = "") -> None:
+    ok = page.evaluate(
+        point_form_script(
+            """
+          const { label, fallbackLabel } = args;
+          let controls = controlsNearLabel(label, 'input[type="checkbox"]');
+          if (!controls.length && fallbackLabel) controls = controlsNearLabel(fallbackLabel, 'input[type="checkbox"]');
+          if (!controls.length) controls = Array.from(document.querySelectorAll('input[type="checkbox"]')).filter(visible);
+          for (const checkbox of controls) {
+            if (!checkbox.checked) checkbox.click();
+            dispatchChange(checkbox);
+            return true;
+          }
+          return false;
+            """
+        ),
+        {"label": label, "fallbackLabel": fallback_label},
+    )
+    if not ok:
+        raise CommentCaptureError("'주의 사항' 동의 체크박스를 찾지 못했습니다.")
+
+
+def check_point_radio(page: Any, group_label: str, option_label: str) -> None:
+    ok = page.evaluate(
+        point_form_script(
+            """
+          const { groupLabel, optionLabel } = args;
+          const controls = controlsNearLabel(groupLabel, 'input[type="radio"]');
+          for (const radio of controls) {
+            const container = closestGroup(radio);
+            const text = clean(container && (container.innerText || container.textContent));
+            if (text.includes(optionLabel) || clean(radio.value).includes(optionLabel)) {
+              if (!radio.checked) radio.click();
+              dispatchChange(radio);
+              return true;
+            }
+          }
+          return false;
+            """
+        ),
+        {"groupLabel": group_label, "optionLabel": option_label},
+    )
+    if not ok:
+        raise CommentCaptureError(f"'{group_label}' 라디오 버튼에서 '{option_label}'를 선택하지 못했습니다.")
+
+
+def set_point_file_input(page: Any, label: str, file_path: Path, fallback_index: int) -> None:
+    file_inputs = page.locator("input[type=file]")
+    try:
+        count = file_inputs.count()
+    except Exception:
+        count = 0
+    if count <= 0:
+        raise CommentCaptureError("파일 첨부 input을 찾지 못했습니다.")
+    index = find_point_file_input_index(page, label)
+    if index is None:
+        index = fallback_index if fallback_index < count else 0
+    file_inputs.nth(index).set_input_files(str(file_path))
+
+
+def find_point_file_input_index(page: Any, label: str) -> int | None:
+    try:
+        index = page.evaluate(
+            point_form_script(
+                """
+              const { label } = args;
+              const inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+              const controls = controlsNearLabel(label, 'input[type="file"]');
+              if (!controls.length) return null;
+              const index = inputs.indexOf(controls[0]);
+              return index >= 0 ? index : null;
+                """
+            ),
+            {"label": label},
+        )
+    except Exception:
+        return None
+    return int(index) if index is not None else None
+
+
+def wait_for_point_request_completion(
+    page: Any,
+    dialog_messages: list[str],
+    timeout_error_type: type[Exception],
+    timeout_ms: int = 300_000,
+) -> None:
+    start_url = page.url or ""
+    start_completion_text = point_completion_text(page)
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        if any(point_message_is_completion(message) for message in dialog_messages):
+            return
+        current_url = page.url or ""
+        if current_url and current_url != start_url and "/point/pointrequest" not in current_url:
+            return
+        current_completion_text = point_completion_text(page)
+        if current_completion_text and current_completion_text != start_completion_text:
+            return
+        page.wait_for_timeout(1_000)
+    raise CommentCaptureError("5분 안에 포인트 신청 완료를 감지하지 못했습니다.")
+
+
+def point_completion_text(page: Any) -> str:
+    try:
+        return compact_text(
+            page.evaluate(
+                """
+                (phrases) => {
+                  const text = (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').trim();
+                  for (const phrase of phrases) {
+                    if (text.includes(phrase)) return phrase;
+                  }
+                  return '';
+                }
+                """,
+                list(POINT_COMPLETION_PHRASES),
+            )
+        )
+    except Exception:
+        return ""
+
+
+def point_message_is_completion(message: str) -> bool:
+    return any(phrase in (message or "") for phrase in POINT_COMPLETION_PHRASES)
+
+
+def point_form_script(body: str) -> str:
+    return f"(args) => {{\n{POINT_FORM_JS}\n{body}\n}}"
+
+
+POINT_FORM_JS = """
+    const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+    const cleanLower = (value) => clean(value).toLocaleLowerCase();
+    const textIncludes = (value, needle) => cleanLower(value).includes(cleanLower(needle));
+    const visible = (el) => {
+      if (!el) return false;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width >= 1 && rect.height >= 1 && style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const closestGroup = (el) => {
+      let current = el;
+      for (let i = 0; current && i < 8; i += 1) {
+        if (current.matches && current.matches('tr, li, fieldset, section, article, .form-group, .form-row, .row, .input-group, div')) {
+          return current;
+        }
+        current = current.parentElement;
+      }
+      return el && el.parentElement;
+    };
+    const nodesWithText = (label) => Array.from(document.querySelectorAll('label, th, td, dt, span, p, div, strong, b'))
+      .map((node) => ({ node, text: clean(node.innerText || node.textContent) }))
+      .filter((item) => textIncludes(item.text, label))
+      .sort((a, b) => a.text.length - b.text.length)
+      .map((item) => item.node);
+    const controlsNearLabel = (label, selector) => {
+      const results = [];
+      const seen = new Set();
+      const add = (node) => {
+        if (node && !seen.has(node)) {
+          seen.add(node);
+          results.push(node);
+        }
+      };
+      for (const node of nodesWithText(label)) {
+        if (node.tagName && node.tagName.toLowerCase() === 'label') {
+          const forId = node.getAttribute('for');
+          if (forId) add(document.getElementById(forId));
+        }
+        let group = closestGroup(node);
+        for (let depth = 0; group && depth < 5; depth += 1) {
+          for (const control of Array.from(group.querySelectorAll(selector))) add(control);
+          if (results.length) return results.filter(Boolean);
+          group = group.parentElement;
+        }
+        let sibling = node.nextElementSibling;
+        for (let i = 0; sibling && i < 6; i += 1) {
+          if (sibling.matches && sibling.matches(selector)) add(sibling);
+          for (const control of Array.from(sibling.querySelectorAll ? sibling.querySelectorAll(selector) : [])) add(control);
+          if (results.length) return results.filter(Boolean);
+          sibling = sibling.nextElementSibling;
+        }
+      }
+      return results.filter(Boolean);
+    };
+    const dispatchChange = (el) => {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    const setValue = (el, value) => {
+      el.focus && el.focus();
+      el.value = value;
+      dispatchChange(el);
+    };
+    const textInputSelector = 'input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"]):not([type="file"]):not([type="button"]):not([type="submit"]):not([type="reset"])';
+    const editableControlSelector = `${textInputSelector}, textarea, select`;
+    const isTextInput = (el) => el && el.matches && el.matches(textInputSelector);
+    const visibleTextInputs = (container = document) => Array.from(container.querySelectorAll(textInputSelector)).filter(visible);
+    const visibleSelects = (container = document) => Array.from(container.querySelectorAll('select')).filter(visible);
+    const optionMatches = (option, wanted) => clean(option.textContent) === wanted || clean(option.value) === wanted;
+    const selectOptionByTextOrValue = (select, wanted) => {
+      if (!select) return false;
+      const option = Array.from(select.options || []).find((item) => optionMatches(item, wanted));
+      if (!option) return false;
+      select.value = option.value;
+      dispatchChange(select);
+      return true;
+    };
+    const controlsIn = (container) => Array.from(container.querySelectorAll(editableControlSelector)).filter(visible);
+    const fieldSetFromControls = (controls) => {
+      const inputs = controls.filter(isTextInput);
+      const select = controls.find((item) => item.matches && item.matches('select') && Array.from(item.options || []).some((option) => optionMatches(option, '1')));
+      return { inputs, select };
+    };
+    const firstCompleteUrlFieldSet = (containers) => {
+      const seen = new Set();
+      for (const container of containers) {
+        if (!container || seen.has(container)) continue;
+        seen.add(container);
+        const fields = fieldSetFromControls(controlsIn(container));
+        if (fields.inputs.length >= 2 && fields.inputs.length <= 4) return fields;
+      }
+      return null;
+    };
+    const urlLabelContainers = () => {
+      const containers = [];
+      const add = (node) => {
+        if (node && !containers.includes(node)) containers.push(node);
+      };
+      for (const labelNode of nodesWithText('URL')) {
+        let group = closestGroup(labelNode);
+        for (let depth = 0; group && depth < 5; depth += 1) {
+          add(group);
+          group = group.parentElement;
+        }
+        let sibling = labelNode.nextElementSibling;
+        for (let i = 0; sibling && i < 6; i += 1) {
+          add(sibling);
+          sibling = sibling.nextElementSibling;
+        }
+      }
+      for (const container of Array.from(document.querySelectorAll('tr, li, fieldset, section, article, .form-group, .form-row, .row, .input-group, div'))) {
+        const text = clean(container.innerText || container.textContent);
+        if (textIncludes(text, 'URL') || textIncludes(text, '주소')) add(container);
+      }
+      return containers;
+    };
+    const urlFieldsByGeometry = () => {
+      const labelNode = nodesWithText('URL')[0] || nodesWithText('주소')[0];
+      if (!labelNode) return null;
+      const labelRect = labelNode.getBoundingClientRect();
+      const labelCenterY = labelRect.top + labelRect.height / 2;
+      const nearControls = Array.from(document.querySelectorAll(editableControlSelector))
+        .filter(visible)
+        .filter((control) => {
+          const rect = control.getBoundingClientRect();
+          const centerY = rect.top + rect.height / 2;
+          return Math.abs(centerY - labelCenterY) <= 140 && rect.left >= labelRect.left - 20;
+        })
+        .sort((a, b) => {
+          const ar = a.getBoundingClientRect();
+          const br = b.getBoundingClientRect();
+          return ar.top - br.top || ar.left - br.left;
+        });
+      const fields = fieldSetFromControls(nearControls);
+      return fields.inputs.length >= 2 ? fields : null;
+    };
+    const urlFieldsBeforeRemark = () => {
+      const inputs = visibleTextInputs(document);
+      if (inputs.length < 2) return null;
+      let remarkTop = Number.POSITIVE_INFINITY;
+      const remarkControl = controlsNearLabel('비고', `${textInputSelector}, textarea`)[0];
+      if (remarkControl) remarkTop = remarkControl.getBoundingClientRect().top;
+      const beforeRemark = inputs.filter((input) => input.getBoundingClientRect().top < remarkTop - 1);
+      if (beforeRemark.length < 2) return null;
+      const selectedInputs = beforeRemark.slice(-2);
+      const secondRect = selectedInputs[1].getBoundingClientRect();
+      const select = visibleSelects(document)
+        .filter((item) => item.getBoundingClientRect().top <= secondRect.bottom + 80)
+        .filter((item) => Array.from(item.options || []).some((option) => optionMatches(option, '1')))
+        .slice(-1)[0] || null;
+      return { inputs: selectedInputs, select };
+    };
+    const findUrlFields = () => {
+      const directControls = controlsNearLabel('URL', editableControlSelector);
+      const directFields = fieldSetFromControls(directControls);
+      if (directFields.inputs.length >= 2 && directFields.inputs.length <= 4) return directFields;
+      const containerFields = firstCompleteUrlFieldSet(urlLabelContainers());
+      if (containerFields) return containerFields;
+      const geometryFields = urlFieldsByGeometry();
+      if (geometryFields) return geometryFields;
+      return urlFieldsBeforeRemark();
+    };
+"""
+
+
 def get_blog_page(context: Any) -> Any:
     pages = open_pages(context)
     blog_page = find_page_by_hosts(pages, ("blog.naver.com", "m.blog.naver.com"))
@@ -1451,6 +2109,18 @@ def get_mail_page(context: Any) -> Any:
     if len(non_login_pages) >= 2:
         bring_page_to_front(non_login_pages[1])
         return non_login_pages[1]
+
+    page = context.new_page()
+    bring_page_to_front(page)
+    return page
+
+
+def get_point_page(context: Any) -> Any:
+    pages = open_pages(context)
+    point_page = find_page_by_hosts(pages, ("point.directwed.co.kr",))
+    if point_page:
+        bring_page_to_front(point_page)
+        return point_page
 
     page = context.new_page()
     bring_page_to_front(page)
@@ -1587,6 +2257,23 @@ def collect_mail_entries(page: Any) -> list[dict[str, Any]]:
 
 def make_mail_output_path(output_dir: Path, blog_article_id: str, email: str) -> Path:
     return make_capture_output_path(output_dir, blog_article_id, target_id_from_email(email), "mail")
+
+
+def find_existing_capture_file(output_dir: Path, blog_article_id: str, target_id: str, capture_kind: str) -> Path | None:
+    base_stem = "_".join(
+        [
+            sanitize_filename(blog_article_id),
+            sanitize_filename(target_id),
+            sanitize_filename(capture_kind),
+        ]
+    )
+    exact_path = output_dir / f"{base_stem}.png"
+    if exact_path.is_file():
+        return exact_path
+    candidates = [path for path in output_dir.glob(f"{base_stem}_*.png") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def capture_mail_body(page: Any, output_path: Path) -> None:
@@ -1841,9 +2528,15 @@ class App(tk.Tk):
             state=tk.DISABLED,
         )
         self.email_capture_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.point_request_button = ttk.Button(
+            button_bar,
+            text="포인트 신청",
+            command=self.start_point_request_batch,
+            state=tk.DISABLED,
+        )
+        self.point_request_button.pack(side=tk.LEFT, padx=(8, 0))
         self.open_folder_button = ttk.Button(button_bar, text="저장 폴더 열기", command=self.open_output_dir)
         self.open_folder_button.pack(side=tk.LEFT, padx=(8, 0))
-
         self.progress = ttk.Progressbar(button_bar, mode="indeterminate", length=180)
         self.progress.pack(side=tk.RIGHT)
 
@@ -1976,6 +2669,99 @@ class App(tk.Tk):
         self.set_busy(True)
         self.process_next_mail_target()
 
+    def start_point_request_batch(self) -> None:
+        selected_targets = self.checked_targets()
+        if not selected_targets:
+            messagebox.showinfo(APP_TITLE, "체크된 포인트 신청 대상이 없습니다.")
+            return
+
+        raw_url = self.url_var.get()
+        output_dir = Path(self.output_dir_var.get() or DEFAULT_SAVE_DIR)
+        self.set_busy(True)
+        self.status_var.set("포인트 신청을 준비하는 중입니다...")
+
+        def progress(message: str) -> None:
+            self.after(0, lambda: self.status_var.set(message))
+
+        def worker() -> None:
+            try:
+                result = run_point_request_batch(
+                    raw_url=raw_url,
+                    output_dir=output_dir,
+                    targets=selected_targets,
+                    progress=progress,
+                    wait_for_user_continue=self.wait_for_point_continue,
+                )
+                self.after(0, lambda: self.handle_point_request_result(result))
+            except Exception as exc:
+                details = str(exc)
+                if not isinstance(exc, CommentCaptureError):
+                    details = f"{details}\n\n{traceback.format_exc()}"
+                self.after(0, lambda: self.handle_error(details))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def wait_for_point_continue(self, payload: dict[str, Any], index: int, total: int) -> bool:
+        event = threading.Event()
+        result = {"continue": False}
+
+        def show_dialog() -> None:
+            self.show_point_continue_dialog(payload, index, total, result, event)
+
+        self.after(0, show_dialog)
+        event.wait()
+        return bool(result["continue"])
+
+    def show_point_continue_dialog(
+        self,
+        payload: dict[str, Any],
+        index: int,
+        total: int,
+        result: dict[str, bool],
+        event: threading.Event,
+    ) -> None:
+        target_id = compact_text(str(payload.get("target_id", "")))
+        blog_article_id = compact_text(str(payload.get("blog_article_id", "")))
+        dialog = tk.Toplevel(self)
+        dialog.title("포인트 신청 계속")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.columnconfigure(0, weight=1)
+
+        message = (
+            f"포인트 신청 폼 입력이 완료되었습니다. ({index}/{total})\n\n"
+            f"글 번호: {blog_article_id}\n"
+            f"공유 아이디: {target_id}\n\n"
+            "Chrome에서 내용을 확인하고 사이트의 '신청' 버튼을 직접 누른 뒤,\n"
+            "이 창의 '계속'을 누르면 다음 대상의 포인트 신청 폼으로 넘어갑니다."
+        )
+        ttk.Label(dialog, text=message, justify=tk.LEFT, wraplength=460).grid(
+            row=0,
+            column=0,
+            padx=18,
+            pady=(18, 12),
+            sticky=tk.W,
+        )
+        button_bar = ttk.Frame(dialog)
+        button_bar.grid(row=1, column=0, padx=18, pady=(0, 18), sticky=tk.E)
+
+        def close_with(value: bool) -> None:
+            result["continue"] = value
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+            event.set()
+
+        ttk.Button(button_bar, text="중단", command=lambda: close_with(False)).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(button_bar, text="계속", command=lambda: close_with(True)).pack(side=tk.RIGHT)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: close_with(False))
+        try:
+            dialog.lift()
+            dialog.focus_force()
+        except Exception:
+            pass
+
     def process_next_mail_target(self, selected_mail_id: str | None = None) -> None:
         while self.mail_batch_index < len(self.mail_batch_targets):
             target = self.mail_batch_targets[self.mail_batch_index]
@@ -2079,6 +2865,36 @@ class App(tk.Tk):
         self.status_var.set(f"메일 본문 캡처 완료: 저장 {saved_count}개, 실패 {failure_count}개, 건너뜀 {skipped_count}개")
         messagebox.showinfo(APP_TITLE, self.batch_result_message("메일 본문 캡처", result))
 
+    def handle_point_request_result(self, result: PointRequestBatchResult) -> None:
+        self.set_busy(False)
+        self.status_var.set(f"포인트 신청 진행 완료: 사용자 확인 {len(result.completed)}개, 실패 {len(result.failures)}개")
+        messagebox.showinfo(APP_TITLE, self.point_result_message(result))
+
+    def point_result_message(self, result: PointRequestBatchResult) -> str:
+        lines = [
+            "포인트 신청 결과",
+            "",
+            f"사용자 확인: {len(result.completed)}개",
+            f"실패: {len(result.failures)}개",
+            f"건너뜀: {len(result.skipped)}개",
+        ]
+        if result.completed:
+            lines.extend(["", "사용자 확인 대상:"])
+            lines.extend(result.completed[:10])
+            if len(result.completed) > 10:
+                lines.append(f"...외 {len(result.completed) - 10}개")
+        if result.failures:
+            lines.extend(["", "실패:"])
+            lines.extend(result.failures[:10])
+            if len(result.failures) > 10:
+                lines.append(f"...외 {len(result.failures) - 10}개")
+        if result.skipped:
+            lines.extend(["", "건너뜀:"])
+            lines.extend(result.skipped[:10])
+            if len(result.skipped) > 10:
+                lines.append(f"...외 {len(result.skipped) - 10}개")
+        return "\n".join(lines)
+
     def batch_result_message(self, title: str, result: BatchCaptureResult) -> str:
         lines = [
             f"{title} 결과",
@@ -2166,12 +2982,14 @@ class App(tk.Tk):
         if busy:
             self.comment_capture_button.configure(state=tk.DISABLED)
             self.email_capture_button.configure(state=tk.DISABLED)
+            self.point_request_button.configure(state=tk.DISABLED)
             self.progress.start(12)
         else:
             self.progress.stop()
             target_state = tk.NORMAL if self.current_targets else tk.DISABLED
             self.comment_capture_button.configure(state=target_state)
             self.email_capture_button.configure(state=target_state)
+            self.point_request_button.configure(state=target_state)
 
     def clear_candidates(self) -> None:
         self.current_candidates = []
@@ -2190,6 +3008,7 @@ class App(tk.Tk):
             self.tree.delete(item)
         self.comment_capture_button.configure(state=tk.DISABLED)
         self.email_capture_button.configure(state=tk.DISABLED)
+        self.point_request_button.configure(state=tk.DISABLED)
 
     def checked_targets(self) -> list[dict[str, Any]]:
         return [target.copy() for target in self.current_targets if target.get("selected")]
