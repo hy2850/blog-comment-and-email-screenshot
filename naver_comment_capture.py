@@ -920,6 +920,7 @@ def run_discover_targets(
             page = prepare_blog_comment_page(context, post, raw_url, PlaywrightTimeoutError, report)
             report("댓글을 최대한 불러오는 중...")
             load_all_comments(page, report)
+            report("댓글 내용을 분석하는 중...")
             entries = collect_comment_entries(page)
             targets, share_marker_index = build_comment_targets(entries, blog_article_id=post.log_no)
             checked_count = sum(1 for target in targets if target["selected"])
@@ -977,8 +978,8 @@ def run_comment_batch_capture(
                 launch_error_message="앱 전용 Chrome 프로필을 열지 못했습니다. 열린 로그인/캡처용 Chrome 창을 닫고 다시 실행해 주세요.",
             )
             page = prepare_blog_comment_page(context, post, raw_url, PlaywrightTimeoutError, report)
-            report("댓글 목록을 다시 확인하는 중...")
-            load_all_comments(page, report)
+            ensure_comments_loaded_for_targets(page, selected_targets, report)
+            report("댓글 내용을 분석하는 중...")
             rows, _ = build_comment_targets(
                 collect_comment_entries(page),
                 include_entries=True,
@@ -1029,54 +1030,122 @@ def load_all_comments(
     page: Any,
     report: Callable[[str], None] | None = None,
     max_rounds: int = 35,
+    stable_round_limit: int = 2,
 ) -> None:
     previous_count = -1
     stable_rounds = 0
+    ineffective_click_rounds = 0
     for round_index in range(max_rounds):
         clicked = try_click_more_comments(page)
         scroll_comment_frames(page)
-        page.wait_for_timeout(700)
-        current_count = len(collect_comment_entries(page))
+        page.wait_for_timeout(500 if clicked else 350)
+        current_count = count_visible_comment_entries(page)
         if report and (round_index == 0 or current_count != previous_count):
             report(f"댓글을 불러오는 중... 현재 {current_count}개")
-        if current_count <= previous_count and not clicked:
-            stable_rounds += 1
+        if current_count <= previous_count:
+            if clicked:
+                ineffective_click_rounds += 1
+            else:
+                stable_rounds += 1
         else:
             stable_rounds = 0
+            ineffective_click_rounds = 0
         previous_count = current_count
-        if stable_rounds >= 4:
+        if stable_rounds >= stable_round_limit or ineffective_click_rounds >= 4:
             break
 
 
 def try_click_more_comments(page: Any) -> bool:
-    selectors = [
-        ".u_cbox_btn_more",
-        ".u_cbox_more_wrap a",
-        ".u_cbox_more_wrap button",
-        "a:has-text('더보기')",
-        "button:has-text('더보기')",
-        "a:has-text('댓글 더보기')",
-        "button:has-text('댓글 더보기')",
-    ]
+    script = """
+        () => {
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width >= 5 && rect.height >= 5 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const clickNode = (el) => {
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+            el.click();
+            return true;
+          };
+          const selectors = [
+            '.u_cbox_btn_more',
+            '.u_cbox_more_wrap a',
+            '.u_cbox_more_wrap button'
+          ];
+          for (const selector of selectors) {
+            for (const node of Array.from(document.querySelectorAll(selector)).slice(0, 5)) {
+              if (visible(node)) return clickNode(node);
+            }
+          }
+          for (const node of Array.from(document.querySelectorAll('a, button')).slice(0, 80)) {
+            const text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            if (visible(node) && (text.includes('댓글 더보기') || text.includes('더보기'))) {
+              return clickNode(node);
+            }
+          }
+          return false;
+        }
+    """
     for frame in page.frames:
-        for selector in selectors:
-            try:
-                locator = frame.locator(selector)
-                count = min(locator.count(), 5)
-            except Exception:
-                continue
-            for index in range(count):
-                item = locator.nth(index)
-                try:
-                    if not item.is_visible(timeout=400):
-                        continue
-                    item.scroll_into_view_if_needed(timeout=1_000)
-                    item.click(timeout=2_000)
-                    page.wait_for_timeout(700)
-                    return True
-                except Exception:
-                    continue
+        try:
+            if frame.evaluate(script):
+                return True
+        except Exception:
+            continue
     return False
+
+
+def count_visible_comment_entries(page: Any) -> int:
+    script = """
+        (selectors) => {
+          const visible = (el) => {
+            if (!el) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width >= 5 && rect.height >= 5 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          for (const selector of selectors) {
+            const count = Array.from(document.querySelectorAll(selector)).filter(visible).length;
+            if (count > 0) return count;
+          }
+          return 0;
+        }
+    """
+    total = 0
+    for frame in page.frames:
+        try:
+            total += int(frame.evaluate(script, COMMENT_CONTAINER_SELECTORS) or 0)
+        except Exception:
+            continue
+    return total
+
+
+def ensure_comments_loaded_for_targets(
+    page: Any,
+    targets: list[dict[str, Any]],
+    report: Callable[[str], None] | None = None,
+) -> None:
+    required_count = required_comment_count_for_targets(targets)
+    current_count = count_visible_comment_entries(page)
+    if required_count and current_count >= required_count:
+        if report:
+            report(f"이미 로드된 댓글 목록을 재사용합니다. 현재 {current_count}개")
+        return
+    if report:
+        report("댓글 목록을 다시 확인하는 중...")
+    load_all_comments(page, report)
+
+
+def required_comment_count_for_targets(targets: list[dict[str, Any]]) -> int:
+    required_count = 0
+    for target in targets:
+        try:
+            required_count = max(required_count, int(target.get("original_index", -1)) + 1)
+        except Exception:
+            continue
+    return required_count
 
 
 def scroll_comment_frames(page: Any) -> None:
